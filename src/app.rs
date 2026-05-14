@@ -145,7 +145,7 @@ pub struct AppConfig {
     pub transition_type: TransitionType,
     pub blur_radius_max: f32,
     pub blur_duration: f32,
-    pub fade_duration: f32,
+    pub transition_duration: f32,
 }
 
 impl Default for AppConfig {
@@ -155,7 +155,7 @@ impl Default for AppConfig {
             transition_type: TransitionType::Smooth,
             blur_radius_max: 20.0,
             blur_duration: 10.0,
-            fade_duration: 0.5,
+            transition_duration: 0.5,
         }
     }
 }
@@ -175,8 +175,8 @@ Commands:
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
   --blur-radius <px>           Max Gaussian blur radius (smooth only; default: 20.0)
-  --blur-duration <sec>        Transition duration in seconds (smooth, slide; default: 10.0)
-  --fade-duration <sec>        New slide fade-in duration in seconds (smooth only; default: 0.5)
+  --blur-duration <sec>        Ghost dissolve duration in seconds (smooth only; default: 10.0)
+  --transition-duration <sec>  Transition duration in seconds (smooth, slide; default: 0.5)
   --help                       Show this help
 
 Transition types:
@@ -232,9 +232,9 @@ pub fn parse_args(args: &[String]) -> Option<AppConfig> {
                 i += 1;
                 config.blur_duration = args.get(i)?.parse().ok()?;
             }
-            "--fade-duration" => {
+            "--transition-duration" => {
                 i += 1;
-                config.fade_duration = args.get(i)?.parse().ok()?;
+                config.transition_duration = args.get(i)?.parse().ok()?;
             }
             _ => {
                 eprintln!("Unknown option: {}", args[i]);
@@ -292,7 +292,7 @@ pub fn init_example_presentation(path: &std::path::Path) {
                 SlideDef {
                     num: 1,
                     name: "Configuration",
-                    notes: "Customize the viewing experience:\n\n- `--blur-radius`: Max Gaussian blur during transitions\n- `--blur-duration`: How long the ghost dissolve lasts\n- `--fade-duration`: Fade-in time for new slides\n\nDefault values work well for most presentations.",
+                    notes: "Customize the viewing experience:\n\n- `--blur-radius`: Max Gaussian blur during transitions\n- `--blur-duration`: How long the ghost dissolve lasts\n- `--transition-duration`: Transition timing for smooth and slide\n\nDefault values work well for most presentations.",
                 },
                 SlideDef {
                     num: 2,
@@ -909,13 +909,31 @@ impl App {
     }
 
     pub fn next_slide(&mut self) {
-        self.transition_direction = (0.0, -1.0);
-        self.navigate_to(self.collection.next_slide(self.current_layer));
+        let target = self.collection.next_slide(self.current_layer);
+        if let Some(t) = target {
+            let same_chapter =
+                self.collection.chapter_of(self.current_layer) == self.collection.chapter_of(t);
+            self.transition_direction = if same_chapter {
+                (0.0, 1.0)
+            } else {
+                (1.0, 0.0)
+            };
+        }
+        self.navigate_to(target);
     }
 
     pub fn prev_slide(&mut self) {
-        self.transition_direction = (0.0, 1.0);
-        self.navigate_to(self.collection.prev_slide(self.current_layer));
+        let target = self.collection.prev_slide(self.current_layer);
+        if let Some(t) = target {
+            let same_chapter =
+                self.collection.chapter_of(self.current_layer) == self.collection.chapter_of(t);
+            self.transition_direction = if same_chapter {
+                (0.0, -1.0)
+            } else {
+                (-1.0, 0.0)
+            };
+        }
+        self.navigate_to(target);
     }
 
     pub fn next_chapter(&mut self) {
@@ -943,7 +961,11 @@ impl App {
 
         self.transition_time += dt;
 
-        if self.transition_time >= self.config.blur_duration {
+        let end_dur = match self.config.transition_type {
+            TransitionType::Slide => self.config.transition_duration,
+            _ => self.config.blur_duration,
+        };
+        if self.transition_time >= end_dur {
             self.is_transitioning = false;
         }
     }
@@ -956,7 +978,7 @@ impl App {
 
         let t = self.transition_time;
         let new_alpha = if self.is_transitioning {
-            let u = (t / self.config.fade_duration).min(1.0);
+            let u = (t / self.config.transition_duration).min(1.0);
             u * u * (3.0 - 2.0 * u)
         } else {
             1.0
@@ -973,7 +995,7 @@ impl App {
         };
 
         let (slide_offset_x, slide_offset_y) = if self.is_transitioning && self.config.transition_type == TransitionType::Slide {
-            let u = (t / self.config.blur_duration).min(1.0);
+            let u = (t / self.config.transition_duration).min(1.0);
             let ease_out = 1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u);
             (
                 self.transition_direction.0 * (1.0 - ease_out),
@@ -1161,14 +1183,14 @@ mod tests {
 
     #[test]
     fn slide_offset_starts_at_direction() {
-        let (ox, oy) = compute_slide_offset(0.0, 10.0, (0.0, -1.0));
+        let (ox, oy) = compute_slide_offset(0.0, 10.0, (0.0, 1.0));
         assert!((ox - 0.0).abs() < 0.001);
-        assert!((oy - (-1.0)).abs() < 0.001);
+        assert!((oy - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn slide_offset_ends_at_zero() {
-        let (ox, oy) = compute_slide_offset(10.0, 10.0, (0.0, -1.0));
+        let (ox, oy) = compute_slide_offset(10.0, 10.0, (0.0, 1.0));
         assert!((ox - 0.0).abs() < 0.001);
         assert!((oy - 0.0).abs() < 0.001);
     }
@@ -1182,9 +1204,9 @@ mod tests {
 
     #[test]
     fn slide_offset_prev_direction() {
-        let (ox, oy) = compute_slide_offset(0.0, 10.0, (0.0, 1.0));
+        let (ox, oy) = compute_slide_offset(0.0, 10.0, (0.0, -1.0));
         assert!((ox - 0.0).abs() < 0.001);
-        assert!((oy - 1.0).abs() < 0.001);
+        assert!((oy - (-1.0)).abs() < 0.001);
     }
 
     #[test]
@@ -1198,10 +1220,10 @@ mod tests {
     fn slide_ease_out_midway() {
         let u = 5.0 / 10.0; // halfway
         let ease_out = 1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u);
-        let (ox, oy) = compute_slide_offset(5.0, 10.0, (0.0, -1.0));
+        let (ox, oy) = compute_slide_offset(5.0, 10.0, (0.0, 1.0));
         assert!((ox - 0.0).abs() < 0.001);
-        // At halfway, ease_out should be 0.875, so offset = -1.0 * (1-0.875) = -0.125
-        assert!((oy - (-(1.0 - ease_out))).abs() < 0.001);
+        // At halfway, ease_out = 0.875, offset = 1.0 * (1-0.875) = 0.125
+        assert!((oy - (1.0 - ease_out)).abs() < 0.001);
     }
 
     #[test]

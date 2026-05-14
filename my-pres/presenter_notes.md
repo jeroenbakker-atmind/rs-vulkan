@@ -27,7 +27,7 @@ Customize the viewing experience:
 
 - `--blur-radius`: Max Gaussian blur during transitions
 - `--blur-duration`: How long the ghost dissolve lasts
-- `--fade-duration`: Fade-in time for new slides
+- `--transition-duration`: Transition timing for smooth and slide
 
 Default values work well for most presentations.
 ## 2_2: Deployment
