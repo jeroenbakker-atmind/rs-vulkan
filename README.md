@@ -17,8 +17,8 @@ Commands:
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
   --blur-radius <px>           Max Gaussian blur radius (smooth only; default: 20.0)
-  --blur-duration <sec>        Ghost dissolve duration in seconds (smooth only; default: 10.0)
-  --transition-duration <sec>  Transition duration in seconds (smooth, slide; default: 0.5)
+  --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
+  --profile                    Print per-frame timing breakdown every second
   --help                       Show this help
 ```
 
@@ -32,7 +32,7 @@ Slides are PNG files named `{chapter}_{slide}.png` (e.g. `1_1.png`, `2_3.png`). 
 # Create a new presentation
 rs-vulkan init my-talk
 
-# Default smooth transition (blur + fade)
+# Default smooth transition (compute blur + feedback)
 rs-vulkan my-talk
 
 # Slide transition, 3 second duration
@@ -41,11 +41,8 @@ rs-vulkan my-talk --transition-type slide --transition-duration 3
 # Instant cuts (no animation)
 rs-vulkan my-talk --transition-type instant
 
-# Smooth with custom blur and faster fade
-rs-vulkan my-talk --blur-radius 15 --transition-duration 0.3
-
-# Longer ghost dissolve with heavier blur
-rs-vulkan my-talk --blur-duration 20 --blur-radius 40
+# Smooth with heavier blur
+rs-vulkan my-talk --blur-radius 40
 
 # Combine slide transition with custom timing
 rs-vulkan my-talk --transition-type slide --transition-duration 2
@@ -65,68 +62,79 @@ flowchart LR
     end
 
     subgraph GPU [GPU - Vulkan]
-        F[Vertex Shader] -->|fullscreen tri| G[Fragment Shader]
+        F[Vertex Shader] -->|fullscreen tri| G[Fragment Shaders]
         H[(Texture Array)] --> G
-        E -->|push constants| G
-        G -->|framebuffer| I[Swapchain]
+        I[(Feedback Textures)] <--> J[Compute Blur]
+        G -->|framebuffer| K[Swapchain]
     end
 
     B -->|create pipeline| F
     B -->|upload| H
 ```
 
-### Rendering pipeline
+### Smooth transition (feedback + compute blur)
 
 ```mermaid
-flowchart TB
-    subgraph Frame [Per-frame rendering]
-        direction LR
-        A1[acquire swapchain image] --> A2[compute transition params]
-        A2 --> A3[push constants]
-        A3 --> A4[draw fullscreen triangle]
-        A4 --> A5[present]
+flowchart LR
+    subgraph Frame [Per-frame smooth transition]
+        A["Pass 1: blend current slide onto input_feedback\n(graphics, SrcAlpha blending)"] --> B["Pass 2: horizontal blur\n(compute, feedback → ping)"]
+        B --> C["Pass 3: vertical blur\n(compute, ping → output_feedback)"]
+        C --> D["Pass 4: present output_feedback + slide\n(graphics, to swapchain)"]
+        D --> E["swap(feedback_A, feedback_B)"]
     end
-
-    subgraph CPU_Update [CPU update loop]
-        B1[navigate_to] -->|set target/prev layers| B2[update]
-        B2 -->|accumulate dt| B3{transition done?}
-        B3 -->|no| B2
-        B3 -->|yes| B4[is_transitioning = false]
-    end
-
-    CPU_Update --> Frame
 ```
 
-### Navigation state machine
+### Pipeline breakdown (smooth transition)
 
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Transitioning: navigate_to()
-    Transitioning --> Transitioning: update() (accumulate time)
-    Transitioning --> Idle: time >= blur_duration
-    Idle --> Idle: new navigate (Instant type)
+| Pass | Type | Source → Dest | Shader |
+|------|------|---------------|--------|
+| 1 | Graphics | slides → feedback (LOAD, alpha blend) | `fs_blend` |
+| 2 | Compute | feedback → ping (horizontal Gaussian) | `cs_blur_h` |
+| 3 | Compute | ping → feedback (vertical Gaussian) | `cs_blur_v` |
+| 4 | Graphics | feedback + slides → swapchain (CLEAR) | `fs_present` |
+
+The input and output feedback textures are swapped at the end of each frame via `feedback_idx ^= 1`, creating an infinite-impulse-response (IIR) blur that progressively blurs the previous content while the new slide accumulates via alpha blending.
+
+### Non-smooth paths
+
+For `instant` and `slide` transition types (and when not transitioning in `smooth` mode), a single graphics pass draws directly to the swapchain:
+
+- `Instant`: just the current layer, fullscreen.
+- `Slide`: previous layer stays, current layer slides in with cubic ease-out (`f(t) = 1 - (1-t)³`).
+
+### Push constant layout
+
+```rust
+#[repr(C)]
+struct PushConstants {
+    current_layer: i32,     // texture array index of current (target) slide
+    previous_layer: i32,    // texture array index of previous (source) slide
+    new_alpha: f32,         // cross-fade / blend weight (0→1, smoothstep)
+    blur_radius: f32,       // Gaussian blur kernel radius (compute shader)
+    slide_offset_x: f32,    // horizontal UV offset for slide transition
+    slide_offset_y: f32,    // vertical UV offset for slide transition
+}
+// Total: 24 bytes
 ```
 
 ## Transition types
 
-| Type      | Description                                 | Config parameters                          |
-|-----------|---------------------------------------------|--------------------------------------------|
-| `smooth`  | Blur + cross-fade + ghost dissolve          | `blur-radius`, `blur-duration`, `transition-duration` |
-| `instant` | Immediate cut, no animation                 | (none)                                     |
-| `slide`   | Slide new slide in with cubic ease-out      | `transition-duration`                      |
+| Type      | Description                                       | Config parameters            |
+|-----------|---------------------------------------------------|------------------------------|
+| `smooth`  | Compute-shader Gaussian blur + feedback ping-pong | `blur-radius`                |
+| `instant` | Immediate cut, no animation                       | (none)                       |
+| `slide`   | Slide new slide in with cubic ease-out            | `transition-duration`        |
 
 ### `smooth`
 
-The outgoing slide is blurred (Gaussian, up to `blur-radius` px), cross-faded with the incoming slide (smoothstep over `transition-duration` sec), and a dim ghost lingers for `blur-duration` sec.
+Uses a two-texture feedback loop. Each frame during the transition:
 
-```mermaid
-flowchart LR
-    subgraph Smooth [smooth transition over time]
-        T0[t=0: prev fully visible] --> TM[t=transition_duration: crossfade done]
-        TM --> TE[t=blur_duration: ghost gone]
-    end
-```
+1. The target slide is alpha-blended onto the input feedback texture (accumulates)
+2. A separable Gaussian blur runs in a compute shader (horizontal → vertical, via a ping-pong intermediate)
+3. The output feedback is drawn to the swapchain, with the target slide blended on top
+4. The feedback textures are swapped for next frame
+
+The blur radius is constant (`--blur-radius`) during the transition. Because the blur is applied every frame, old content progressively blurs out via the IIR feedback loop while the new slide becomes dominant through continuous alpha blending.
 
 ### `instant`
 
@@ -144,53 +152,3 @@ The incoming slide slides into view with a cubic ease-out curve (`f(t) = 1 - (1-
 | `prev_chapter` | Slides in from **left** (rightward) |
 
 Duration is controlled by `--transition-duration` (default 0.5s).
-
-```mermaid
-flowchart TD
-    subgraph Directions [Slide directions]
-        NS[next_slide] -->|from bottom| CENTER
-        PS[prev_slide] -->|from top| CENTER
-        NC[next_chapter] -->|from right| CENTER
-        PC[prev_chapter] -->|from left| CENTER
-    end
-```
-
-### Shader composition
-
-The fragment shader computes two paths in parallel and selects between them:
-
-- **Smooth path**: blurs `previous_layer`, cross-fades with `current_layer`, applies ghost
-- **Slide path**: offsets `current_layer` UV by `slide_offset`, shows `previous_layer` where offset UV is out of bounds
-
-Selection is driven by `has_slide = (slide_offset_x != 0 || slide_offset_y != 0)`, so no pipeline switch is needed.
-
-```mermaid
-flowchart LR
-    subgraph FS [Fragment Shader]
-        UV[v_uv] --> SMOOTH
-        UV --> SLIDE_UV[offset UV]
-        SLIDE_UV --> SLIDE
-        PC[push constants] -->|slide_offset| SLIDE
-        PC -->|blur/fade params| SMOOTH
-        SMOOTH -->|smooth_result| SELECT{has_slide?}
-        SLIDE -->|slide_result| SELECT
-        SELECT -->|no| SMOOTH_OUT[smooth_result]
-        SELECT -->|yes| SLIDE_OUT[slide_result]
-    end
-```
-
-## Push constant layout
-
-```rust
-#[repr(C)]
-struct PushConstantData {
-    current_layer: i32,     // texture array index of current (target) slide
-    previous_layer: i32,    // texture array index of previous (source) slide
-    new_alpha: f32,         // cross-fade weight (0→1, smoothstep over transition_duration)
-    ghost_strength: f32,    // ghost overlay intensity (1→0 over blur_duration)
-    blur_radius: f32,       // Gaussian blur radius (0→max over blur_duration)
-    slide_offset_x: f32,    // horizontal UV offset for slide transition
-    slide_offset_y: f32,    // vertical UV offset for slide transition
-}
-// Total: 28 bytes (5 × 4 + 2 × 4)
-```

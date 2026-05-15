@@ -328,7 +328,6 @@ fn parse_args_default_config() {
     let cfg = config.unwrap();
     assert_eq!(cfg.slides_path, PathBuf::from("/slides"));
     assert!((cfg.blur_radius_max - 20.0).abs() < 1e-6);
-    assert!((cfg.blur_duration - 10.0).abs() < 1e-6);
     assert!((cfg.transition_duration - 0.5).abs() < 1e-6);
 }
 
@@ -337,14 +336,12 @@ fn parse_args_custom_values() {
     let args: Vec<String> = vec![
         "program".into(), "/slides".into(),
         "--blur-radius".into(), "30.0".into(),
-        "--blur-duration".into(), "5.0".into(),
         "--transition-duration".into(), "1.0".into(),
     ];
     let config = app::parse_args(&args);
     assert!(config.is_some());
     let cfg = config.unwrap();
     assert!((cfg.blur_radius_max - 30.0).abs() < 1e-6);
-    assert!((cfg.blur_duration - 5.0).abs() < 1e-6);
     assert!((cfg.transition_duration - 1.0).abs() < 1e-6);
 }
 

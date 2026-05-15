@@ -15,18 +15,17 @@ use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
 use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType,
 };
-use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::PhysicalDeviceType;
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, QueueCreateInfo, QueueFlags,
 };
 use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode};
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
-use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, ImageSubresourceRange, ImageAspects};
+use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, ImageSubresourceRange, ImageAspects, ImageLayout};
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
-use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
-
+use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState, ColorComponents};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
@@ -39,6 +38,7 @@ use vulkano::pipeline::layout::{PipelineLayout, PipelineLayoutCreateInfo, PushCo
 use vulkano::pipeline::DynamicState;
 use vulkano::pipeline::PipelineBindPoint;
 use vulkano::pipeline::PipelineShaderStageCreateInfo;
+use vulkano::pipeline::compute::{ComputePipeline, ComputePipelineCreateInfo};
 use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 use vulkano::format::{ClearValue, Format};
 use vulkano::swapchain::{
@@ -67,7 +67,7 @@ void main() {
     }
 }
 
-mod fs {
+mod fs_blend {
     vulkano_shaders::shader! {
         ty: "fragment",
         src: r"
@@ -79,7 +79,6 @@ layout(push_constant) uniform PC {
     int   current_layer;
     int   previous_layer;
     float new_alpha;
-    float ghost_strength;
     float blur_radius;
     float slide_offset_x;
     float slide_offset_y;
@@ -87,46 +86,171 @@ layout(push_constant) uniform PC {
 
 layout(set = 0, binding = 0) uniform sampler2DArray slides;
 
-vec3 blur_layer(sampler2DArray tex, vec2 uv, int layer, float radius) {
-    vec2 texel = 1.0 / vec2(textureSize(tex, 0));
-    vec3 acc = vec3(0.0);
-    float total = 0.0;
-    const int HALF = 5;
-    float step_s = max(1.0, radius / float(HALF));
-    for (int x = -HALF; x <= HALF; x++) {
-        for (int y = -HALF; y <= HALF; y++) {
-            vec2 off = vec2(float(x), float(y)) * step_s * texel;
-            float w = exp(-float(x*x + y*y) / (2.0 * float(HALF * HALF)));
-            acc += texture(tex, vec3(uv + off, layer)).rgb * w;
-            total += w;
-        }
+void main() {
+    vec3 slide = texture(slides, vec3(v_uv, pc.current_layer)).rgb;
+    f_color = vec4(slide, pc.new_alpha);
+}
+",
     }
-    return acc / total;
 }
 
+mod cs_blur {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    int   current_layer;
+    int   previous_layer;
+    float new_alpha;
+    float blur_radius;
+    float slide_offset_x;
+    float slide_offset_y;
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+shared vec4 cache[16][16];
+
 void main() {
-    vec3 prev = texture(slides, vec3(v_uv, pc.previous_layer)).rgb;
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(src);
+    if (c.x >= sz.x || c.y >= sz.y) return;
 
-    // Slide transition: offset the current layer UV
-    vec2 slide_uv = v_uv - vec2(pc.slide_offset_x, pc.slide_offset_y);
-    float in_slide = float(
-        slide_uv.x >= 0.0 && slide_uv.x <= 1.0 &&
-        slide_uv.y >= 0.0 && slide_uv.y <= 1.0
-    );
-    vec3 slide_curr = texture(slides, vec3(clamp(slide_uv, vec2(0.0), vec2(1.0)), pc.current_layer)).rgb;
+    int r = int(max(1.0, pc.blur_radius));
+    float sigma = float(r) * 0.333;
+    vec4 accum = vec4(0.0);
+    float total = 0.0;
 
-    // Smooth transition: blur + fade + ghost
-    vec3 blurred_prev = blur_layer(slides, v_uv, pc.previous_layer, pc.blur_radius);
-    vec3 smooth_curr = texture(slides, vec3(v_uv, pc.current_layer)).rgb;
-    vec3 cross = mix(blurred_prev, smooth_curr, pc.new_alpha);
-    vec3 smooth_result = mix(cross, blurred_prev, pc.ghost_strength * 0.15);
+    // direction of blur is the X-axis (set in the shader specialization via swapping)
+    for (int x = -r; x <= r; x++) {
+        ivec2 p = ivec2(clamp(c.x + x, 0, sz.x - 1), c.y);
+        float w = exp(-float(x * x) / (2.0 * sigma * sigma));
+        accum += imageLoad(src, p) * w;
+        total += w;
+    }
 
-    // Select between slide and smooth based on whether slide offset is active
-    float has_slide = float(pc.slide_offset_x != 0.0 || pc.slide_offset_y != 0.0);
-    vec3 slide_result = mix(prev, slide_curr, in_slide);
-    vec3 result = mix(smooth_result, slide_result, has_slide);
+    imageStore(dst, c, accum / total);
+}
+",
+    }
+}
 
+mod cs_blur_v {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    int   current_layer;
+    int   previous_layer;
+    float new_alpha;
+    float blur_radius;
+    float slide_offset_x;
+    float slide_offset_y;
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
+
+shared vec4 cache[16][16];
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(src);
+    if (c.x >= sz.x || c.y >= sz.y) return;
+
+    int r = int(max(1.0, pc.blur_radius));
+    float sigma = float(r) * 0.333;
+    vec4 accum = vec4(0.0);
+    float total = 0.0;
+
+    for (int y = -r; y <= r; y++) {
+        ivec2 p = ivec2(c.x, clamp(c.y + y, 0, sz.y - 1));
+        float w = exp(-float(y * y) / (2.0 * sigma * sigma));
+        accum += imageLoad(src, p) * w;
+        total += w;
+    }
+
+    imageStore(dst, c, accum / total);
+}
+",
+    }
+}
+
+mod fs_present {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: r"
+#version 460
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 f_color;
+
+layout(push_constant) uniform PC {
+    int   current_layer;
+    int   previous_layer;
+    float new_alpha;
+    float blur_radius;
+    float slide_offset_x;
+    float slide_offset_y;
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2D feedback;
+layout(set = 0, binding = 1) uniform sampler2DArray slides;
+
+void main() {
+    vec3 fb = texture(feedback, v_uv).rgb;
+    vec3 slide = texture(slides, vec3(v_uv, pc.current_layer)).rgb;
+    vec3 result = mix(fb, slide, pc.new_alpha);
     f_color = vec4(result, 1.0);
+}
+",
+    }
+}
+
+mod fs_direct {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: r"
+#version 460
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 f_color;
+
+layout(push_constant) uniform PC {
+    int   current_layer;
+    int   previous_layer;
+    float new_alpha;
+    float blur_radius;
+    float slide_offset_x;
+    float slide_offset_y;
+} pc;
+
+layout(set = 0, binding = 0) uniform sampler2DArray slides;
+
+void main() {
+    vec3 slide;
+
+    // Slide transition if offset is active
+    float has_slide = float(pc.slide_offset_x != 0.0 || pc.slide_offset_y != 0.0);
+    if (has_slide > 0.5) {
+        vec3 prev = texture(slides, vec3(v_uv, pc.previous_layer)).rgb;
+        vec2 slide_uv = v_uv - vec2(pc.slide_offset_x, pc.slide_offset_y);
+        float in_slide = float(
+            slide_uv.x >= 0.0 && slide_uv.x <= 1.0 &&
+            slide_uv.y >= 0.0 && slide_uv.y <= 1.0
+        );
+        vec3 slide_curr = texture(slides, vec3(clamp(slide_uv, vec2(0.0), vec2(1.0)), pc.current_layer)).rgb;
+        slide = mix(prev, slide_curr, in_slide);
+    } else {
+        slide = texture(slides, vec3(v_uv, pc.current_layer)).rgb;
+    }
+
+    f_color = vec4(slide, 1.0);
 }
 ",
     }
@@ -144,8 +268,8 @@ pub struct AppConfig {
     pub slides_path: std::path::PathBuf,
     pub transition_type: TransitionType,
     pub blur_radius_max: f32,
-    pub blur_duration: f32,
     pub transition_duration: f32,
+    pub profiling: bool,
 }
 
 impl Default for AppConfig {
@@ -154,8 +278,8 @@ impl Default for AppConfig {
             slides_path: std::path::PathBuf::new(),
             transition_type: TransitionType::Smooth,
             blur_radius_max: 20.0,
-            blur_duration: 10.0,
             transition_duration: 0.5,
+            profiling: false,
         }
     }
 }
@@ -175,12 +299,12 @@ Commands:
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
   --blur-radius <px>           Max Gaussian blur radius (smooth only; default: 20.0)
-  --blur-duration <sec>        Ghost dissolve duration in seconds (smooth only; default: 10.0)
-  --transition-duration <sec>  Transition duration in seconds (smooth, slide; default: 0.5)
+  --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
+  --profile                    Print per-frame timing breakdown every second
   --help                       Show this help
 
 Transition types:
-  smooth  - Blur + fade + ghost dissolve (default)
+  smooth  - Compute-shader blur with feedback ping-pong (default)
   instant - No animation, immediate cut
   slide   - New slide slides in; from bottom for slides, from right for chapters"
     );
@@ -228,13 +352,12 @@ pub fn parse_args(args: &[String]) -> Option<AppConfig> {
                 i += 1;
                 config.blur_radius_max = args.get(i)?.parse().ok()?;
             }
-            "--blur-duration" => {
-                i += 1;
-                config.blur_duration = args.get(i)?.parse().ok()?;
-            }
             "--transition-duration" => {
                 i += 1;
                 config.transition_duration = args.get(i)?.parse().ok()?;
+            }
+                "--profile" => {
+                config.profiling = true;
             }
             _ => {
                 eprintln!("Unknown option: {}", args[i]);
@@ -292,7 +415,7 @@ pub fn init_example_presentation(path: &std::path::Path) {
                 SlideDef {
                     num: 1,
                     name: "Configuration",
-                    notes: "Customize the viewing experience:\n\n- `--blur-radius`: Max Gaussian blur during transitions\n- `--blur-duration`: How long the ghost dissolve lasts\n- `--transition-duration`: Transition timing for smooth and slide\n\nDefault values work well for most presentations.",
+                    notes: "Customize the viewing experience:\n\n- `--blur-radius`: Max Gaussian blur during transitions\n- `--transition-duration`: Transition timing\n\nDefault values work well for most presentations.",
                 },
                 SlideDef {
                     num: 2,
@@ -308,7 +431,7 @@ pub fn init_example_presentation(path: &std::path::Path) {
                 SlideDef {
                     num: 1,
                     name: "Summary",
-                    notes: "RS-Vulkan features:\n\n- Hardware-accelerated rendering via Vulkan\n- Smooth transitions with blur and fade effects\n- Presenter notes support\n- Chapter-based navigation\n- Fullscreen presentation mode",
+                    notes: "RS-Vulkan features:\n\n- Hardware-accelerated rendering via Vulkan\n- Smooth transitions with compute-shader blur and feedback\n- Presenter notes support\n- Chapter-based navigation\n- Fullscreen presentation mode",
                 },
                 SlideDef {
                     num: 2,
@@ -365,17 +488,47 @@ pub fn init_example_presentation(path: &std::path::Path) {
     std::fs::write(&notes_path, notes_content).expect("Failed to write presenter notes");
 }
 
+#[allow(dead_code)]
 pub struct GpuResources {
     pub _device: Arc<Device>,
     pub queue: Arc<vulkano::device::Queue>,
     pub _memory_allocator: Arc<StandardMemoryAllocator>,
+    pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub swapchain: Arc<Swapchain>,
     pub _swapchain_images: Vec<Arc<Image>>,
     pub swapchain_image_views: Vec<Arc<ImageView>>,
-    pub pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
-    pub pipeline_layout: Arc<PipelineLayout>,
-    pub descriptor_set: Arc<DescriptorSet>,
+
+    // Direct rendering pipeline (for Instant/Slide and non-transitioning)
+    pub direct_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
+    pub direct_pipeline_layout: Arc<PipelineLayout>,
+
+    // Smooth transition feedback pipelines
+    pub blend_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
+    pub blend_pipeline_layout: Arc<PipelineLayout>,
+    pub blur_h_pipeline: Arc<ComputePipeline>,
+    pub blur_v_pipeline: Arc<ComputePipeline>,
+    pub blur_pipeline_layout: Arc<PipelineLayout>,
+    pub present_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
+    pub present_pipeline_layout: Arc<PipelineLayout>,
+
+    // Slides sampler descriptor set (shared by direct and blend pipelines)
+    pub slides_descriptor_set: Arc<DescriptorSet>,
+
+    // Feedback textures
+    pub feedback: [Arc<Image>; 2],
+    pub feedback_view: [Arc<ImageView>; 2],
+    pub ping_image: Arc<Image>,
+    pub ping_view: Arc<ImageView>,
+    pub sampler: Arc<Sampler>,
+
+    // Present descriptor sets (one per feedback texture)
+    pub present_descriptor_set: [Arc<DescriptorSet>; 2],
+
+    // Blur descriptor sets
+    pub blur_h_descriptor_set: [Arc<DescriptorSet>; 2], // [src=fb[0]→ping, src=fb[1]→ping]
+    pub blur_v_descriptor_set: [Arc<DescriptorSet>; 2], // [src=ping→fb[0], src=ping→fb[1]]
+
     pub _format: Format,
     pub window: Arc<winit::window::Window>,
 }
@@ -391,6 +544,9 @@ pub struct App {
     pub config: AppConfig,
     pub last_frame: Instant,
     pub transition_direction: (f32, f32),
+    feedback_idx: usize,
+    frame_count: u64,
+    last_fps_print: Instant,
     previous_frame: Option<Box<dyn GpuFuture>>,
 }
 
@@ -550,6 +706,44 @@ fn create_texture_array(
     Ok((image, view, sampler))
 }
 
+fn create_feedback_image(
+    allocator: &Arc<StandardMemoryAllocator>,
+    extent: [u32; 2],
+) -> Result<Arc<Image>, Box<dyn std::error::Error>> {
+    let img = Image::new(
+        allocator.clone() as Arc<dyn vulkano::memory::allocator::MemoryAllocator>,
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R16G16B16A16_SFLOAT,
+            extent: [extent[0], extent[1], 1],
+            array_layers: 1,
+            mip_levels: 1,
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            ..Default::default()
+        },
+        AllocationCreateInfo::default(),
+    )?;
+    Ok(img)
+}
+
+fn create_feedback_view(
+    image: Arc<Image>,
+) -> Result<Arc<ImageView>, Box<dyn std::error::Error>> {
+    Ok(ImageView::new(
+        image,
+        ImageViewCreateInfo {
+            view_type: ImageViewType::Dim2d,
+            format: Format::R16G16B16A16_SFLOAT,
+            subresource_range: ImageSubresourceRange {
+                aspects: ImageAspects::COLOR,
+                mip_levels: 0..1,
+                array_layers: 0..1,
+            },
+            ..Default::default()
+        },
+    )?)
+}
+
 pub fn create_app(
     config: AppConfig,
     event_loop: &winit::event_loop::ActiveEventLoop,
@@ -673,7 +867,44 @@ pub fn create_app(
     )
     .map_err(|e| format!("create_texture_array: {e}"))?;
 
-    let descriptor_set_layout = DescriptorSetLayout::new(
+    let scene_extent = swapchain_images[0].extent();
+    let extent2 = [scene_extent[0], scene_extent[1]];
+
+    // Create feedback textures (ping-pong pair) and intermediate ping buffer
+    let feedback_img_0 = create_feedback_image(&memory_allocator, extent2)?;
+    let feedback_img_1 = create_feedback_image(&memory_allocator, extent2)?;
+    let feedback_view_0 = create_feedback_view(feedback_img_0.clone())?;
+    let feedback_view_1 = create_feedback_view(feedback_img_1.clone())?;
+
+    let ping_image = Image::new(
+        memory_allocator.clone() as Arc<dyn vulkano::memory::allocator::MemoryAllocator>,
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R16G16B16A16_SFLOAT,
+            extent: [scene_extent[0], scene_extent[1], 1],
+            array_layers: 1,
+            mip_levels: 1,
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            ..Default::default()
+        },
+        AllocationCreateInfo::default(),
+    )?;
+    let ping_view = ImageView::new(
+        ping_image.clone(),
+        ImageViewCreateInfo {
+            view_type: ImageViewType::Dim2d,
+            format: Format::R16G16B16A16_SFLOAT,
+            subresource_range: ImageSubresourceRange {
+                aspects: ImageAspects::COLOR,
+                mip_levels: 0..1,
+                array_layers: 0..1,
+            },
+            ..Default::default()
+        },
+    )?;
+
+    // Shared descriptor set for slides
+    let slides_descriptor_set_layout = DescriptorSetLayout::new(
         device.clone(),
         DescriptorSetLayoutCreateInfo {
             bindings: std::collections::BTreeMap::from([(
@@ -686,31 +917,16 @@ pub fn create_app(
             )]),
             ..Default::default()
         },
-    )
-    .map_err(|e| format!("descriptor_set_layout: {e}"))?;
-
-    let pipeline_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![descriptor_set_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::FRAGMENT,
-                offset: 0,
-                size: 28,
-            }],
-            ..Default::default()
-        },
-    )
-    .map_err(|e| format!("pipeline_layout: {e}"))?;
+    )?;
 
     let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
         device.clone(),
         Default::default(),
     ));
 
-    let descriptor_set = DescriptorSet::new(
+    let slides_descriptor_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
-        descriptor_set_layout.clone(),
+        slides_descriptor_set_layout.clone(),
         [WriteDescriptorSet::image_view_sampler(
             0,
             texture_view.clone(),
@@ -718,28 +934,189 @@ pub fn create_app(
         )],
         [],
     )
-    .map_err(|e| format!("descriptor_set: {e}"))?;
+    .map_err(|e| format!("slides descriptor_set: {e}"))?;
+
+    // Direct pipeline layout (for Instant/Slide and non-transitioning)
+    let direct_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![slides_descriptor_set_layout.clone()],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::FRAGMENT,
+                offset: 0,
+                size: 24,
+            }],
+            ..Default::default()
+        },
+    )?;
+
+    // Blend pipeline: renders slide onto feedback with alpha blending
+    let blend_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![slides_descriptor_set_layout.clone()],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::FRAGMENT,
+                offset: 0,
+                size: 24,
+            }],
+            ..Default::default()
+        },
+    )?;
 
     let vs_module = vs::load(device.clone())
         .map_err(|e| format!("vs load: {e}"))?;
-    let fs_module = fs::load(device.clone())
-        .map_err(|e| format!("fs load: {e}"))?;
+    let fs_blend_module = fs_blend::load(device.clone())
+        .map_err(|e| format!("fs_blend load: {e}"))?;
+    let cs_blur_module = cs_blur::load(device.clone())
+        .map_err(|e| format!("cs_blur load: {e}"))?;
+    let cs_blur_v_module = cs_blur_v::load(device.clone())
+        .map_err(|e| format!("cs_blur_v load: {e}"))?;
+    let fs_present_module = fs_present::load(device.clone())
+        .map_err(|e| format!("fs_present load: {e}"))?;
+    let fs_direct_module = fs_direct::load(device.clone())
+        .map_err(|e| format!("fs_direct load: {e}"))?;
 
     let vs_entry = vs_module
         .entry_point("main")
         .ok_or("Vertex shader entry point 'main' not found")?;
-    let fs_entry = fs_module
+    let fs_blend_entry = fs_blend_module
         .entry_point("main")
-        .ok_or("Fragment shader entry point 'main' not found")?;
+        .ok_or("Fs_blend fragment shader entry point 'main' not found")?;
+    let cs_blur_entry = cs_blur_module
+        .entry_point("main")
+        .ok_or("Cs_blur compute shader entry point 'main' not found")?;
+    let cs_blur_v_entry = cs_blur_v_module
+        .entry_point("main")
+        .ok_or("Cs_blur_v compute shader entry point 'main' not found")?;
+    let fs_present_entry = fs_present_module
+        .entry_point("main")
+        .ok_or("Fs_present fragment shader entry point 'main' not found")?;
+    let fs_direct_entry = fs_direct_module
+        .entry_point("main")
+        .ok_or("Fs_direct fragment shader entry point 'main' not found")?;
 
-    let pipeline =
+    // Blend pipeline (smooth, blends slide onto feedback)
+    let blend_pipeline =
         vulkano::pipeline::graphics::GraphicsPipeline::new(
             device.clone(),
             None,
             GraphicsPipelineCreateInfo {
                 stages: smallvec![
-                    PipelineShaderStageCreateInfo::new(vs_entry),
-                    PipelineShaderStageCreateInfo::new(fs_entry),
+                    PipelineShaderStageCreateInfo::new(vs_entry.clone()),
+                    PipelineShaderStageCreateInfo::new(fs_blend_entry),
+                ],
+                vertex_input_state: Some(VertexInputState::default()),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                dynamic_state: [
+                    DynamicState::Viewport,
+                    DynamicState::Scissor,
+                ].into_iter().collect(),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState {
+                    cull_mode: CullMode::None,
+                    ..Default::default()
+                }),
+                multisample_state: Some(MultisampleState::default()),
+                depth_stencil_state: None,
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend {
+                            src_color_blend_factor: BlendFactor::SrcAlpha,
+                            dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                            color_blend_op: BlendOp::Add,
+                            src_alpha_blend_factor: BlendFactor::One,
+                            dst_alpha_blend_factor: BlendFactor::Zero,
+                            alpha_blend_op: BlendOp::Add,
+                        }),
+                        color_write_mask: ColorComponents::all(),
+                        ..Default::default()
+                    },
+                )),
+                subpass: Some(PipelineSubpassType::BeginRendering(
+                    PipelineRenderingCreateInfo {
+                        color_attachment_formats: vec![Some(Format::R16G16B16A16_SFLOAT)],
+                        ..Default::default()
+                    },
+                )),
+                ..GraphicsPipelineCreateInfo::layout(blend_pipeline_layout.clone())
+            },
+        )
+        .map_err(|e| format!("blend_pipeline: {e}"))?;
+
+    // Present pipeline (smooth, draws feedback + slide to swapchain)
+    let present_descriptor_set_layout = DescriptorSetLayout::new(
+        device.clone(),
+        DescriptorSetLayoutCreateInfo {
+            bindings: std::collections::BTreeMap::from([
+                (0u32, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: vulkano::shader::ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+                }),
+                (1u32, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: vulkano::shader::ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+                }),
+            ]),
+            ..Default::default()
+        },
+    )?;
+
+    let present_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![present_descriptor_set_layout.clone()],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::FRAGMENT,
+                offset: 0,
+                size: 24,
+            }],
+            ..Default::default()
+        },
+    )?;
+
+    // Create present descriptor sets (one per feedback texture)
+    let make_present_set = |feedback_view: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
+        DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            present_descriptor_set_layout.clone(),
+            [
+                WriteDescriptorSet::image_view_with_layout_sampler(
+                    0,
+                    DescriptorImageViewInfo {
+                        image_view: feedback_view,
+                        image_layout: ImageLayout::General,
+                    },
+                    sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    texture_view.clone(),
+                    sampler.clone(),
+                ),
+            ],
+            [],
+        )
+        .map_err(|e| format!("present descriptor_set: {e}").into())
+    };
+
+    let present_set_0 = make_present_set(feedback_view_0.clone())?;
+    let present_set_1 = make_present_set(feedback_view_1.clone())?;
+
+    let present_pipeline =
+        vulkano::pipeline::graphics::GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: smallvec![
+                    PipelineShaderStageCreateInfo::new(vs_entry.clone()),
+                    PipelineShaderStageCreateInfo::new(fs_present_entry),
                 ],
                 vertex_input_state: Some(VertexInputState::default()),
                 input_assembly_state: Some(InputAssemblyState {
@@ -767,10 +1144,135 @@ pub fn create_app(
                         ..Default::default()
                     },
                 )),
-                ..GraphicsPipelineCreateInfo::layout(pipeline_layout.clone())
+                ..GraphicsPipelineCreateInfo::layout(present_pipeline_layout.clone())
             },
         )
-        .map_err(|e| format!("graphics_pipeline: {e}"))?;
+        .map_err(|e| format!("present_pipeline: {e}"))?;
+
+    // Direct pipeline (Instant / Slide / non-transitioning)
+    let direct_pipeline =
+        vulkano::pipeline::graphics::GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: smallvec![
+                    PipelineShaderStageCreateInfo::new(vs_entry),
+                    PipelineShaderStageCreateInfo::new(fs_direct_entry),
+                ],
+                vertex_input_state: Some(VertexInputState::default()),
+                input_assembly_state: Some(InputAssemblyState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                }),
+                dynamic_state: [
+                    DynamicState::Viewport,
+                    DynamicState::Scissor,
+                ].into_iter().collect(),
+                viewport_state: Some(ViewportState::default()),
+                rasterization_state: Some(RasterizationState {
+                    cull_mode: CullMode::None,
+                    ..Default::default()
+                }),
+                multisample_state: Some(MultisampleState::default()),
+                depth_stencil_state: None,
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState::default(),
+                )),
+                subpass: Some(PipelineSubpassType::BeginRendering(
+                    PipelineRenderingCreateInfo {
+                        color_attachment_formats: vec![Some(format)],
+                        ..Default::default()
+                    },
+                )),
+                ..GraphicsPipelineCreateInfo::layout(direct_pipeline_layout.clone())
+            },
+        )
+        .map_err(|e| format!("direct_pipeline: {e}"))?;
+
+    // Compute blur pipeline layout
+    let blur_descriptor_set_layout = DescriptorSetLayout::new(
+        device.clone(),
+        DescriptorSetLayoutCreateInfo {
+            bindings: std::collections::BTreeMap::from([
+                (0u32, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: vulkano::shader::ShaderStages::COMPUTE,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
+                }),
+                (1u32, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: vulkano::shader::ShaderStages::COMPUTE,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
+                }),
+            ]),
+            ..Default::default()
+        },
+    )?;
+
+    let blur_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![blur_descriptor_set_layout.clone()],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::COMPUTE,
+                offset: 0,
+                size: 24,
+            }],
+            ..Default::default()
+        },
+    )?;
+
+    // Create blur descriptor sets for both permutations
+    let make_blur_set = |src: Arc<ImageView>, dst: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
+        DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            blur_descriptor_set_layout.clone(),
+            [
+                WriteDescriptorSet::image_view_with_layout(
+                    0,
+                    DescriptorImageViewInfo {
+                        image_view: src,
+                        image_layout: ImageLayout::General,
+                    },
+                ),
+                WriteDescriptorSet::image_view_with_layout(
+                    1,
+                    DescriptorImageViewInfo {
+                        image_view: dst,
+                        image_layout: ImageLayout::General,
+                    },
+                ),
+            ],
+            [],
+        )
+        .map_err(|e| format!("blur descriptor_set: {e}").into())
+    };
+
+    let blur_h_set_0 = make_blur_set(feedback_view_0.clone(), ping_view.clone())?;
+    let blur_h_set_1 = make_blur_set(feedback_view_1.clone(), ping_view.clone())?;
+    let blur_v_set_0 = make_blur_set(ping_view.clone(), feedback_view_0.clone())?;
+    let blur_v_set_1 = make_blur_set(ping_view.clone(), feedback_view_1.clone())?;
+
+    let blur_h_pipeline = ComputePipeline::new(
+        device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(
+            PipelineShaderStageCreateInfo::new(cs_blur_entry),
+            blur_pipeline_layout.clone(),
+        ),
+    )
+    .map_err(|e| format!("blur_h_pipeline: {e}"))?;
+
+    let blur_v_pipeline = ComputePipeline::new(
+        device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(
+            PipelineShaderStageCreateInfo::new(cs_blur_v_entry),
+            blur_pipeline_layout.clone(),
+        ),
+    )
+    .map_err(|e| format!("blur_v_pipeline: {e}"))?;
 
     if let Some(meta) = collection.meta(0) {
         println!("{}", texture::format_slide_display(meta, 0, collection.len()));
@@ -781,13 +1283,29 @@ pub fn create_app(
             _device: device,
             queue,
             _memory_allocator: memory_allocator,
+            descriptor_set_allocator,
             command_buffer_allocator: cmd_allocator,
             swapchain,
             _swapchain_images: swapchain_images,
             swapchain_image_views,
-            pipeline,
-            pipeline_layout,
-            descriptor_set,
+            direct_pipeline,
+            direct_pipeline_layout,
+            blend_pipeline,
+            blend_pipeline_layout,
+            blur_h_pipeline,
+            blur_v_pipeline,
+            blur_pipeline_layout,
+            present_pipeline,
+            present_pipeline_layout,
+            slides_descriptor_set,
+            feedback: [feedback_img_0, feedback_img_1],
+            feedback_view: [feedback_view_0, feedback_view_1],
+            ping_image,
+            ping_view,
+            sampler,
+            present_descriptor_set: [present_set_0, present_set_1],
+            blur_h_descriptor_set: [blur_h_set_0, blur_h_set_1],
+            blur_v_descriptor_set: [blur_v_set_0, blur_v_set_1],
             _format: format,
             window,
         },
@@ -798,6 +1316,9 @@ pub fn create_app(
         transition_time: 0.0,
         is_transitioning: false,
         transition_direction: (0.0, 0.0),
+        feedback_idx: 0,
+        frame_count: 0,
+        last_fps_print: Instant::now(),
         config,
         last_frame: Instant::now(),
         previous_frame: None,
@@ -863,11 +1384,10 @@ fn create_swapchain(
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct PushConstantData {
+struct PushConstants {
     current_layer: i32,
     previous_layer: i32,
     new_alpha: f32,
-    ghost_strength: f32,
     blur_radius: f32,
     slide_offset_x: f32,
     slide_offset_y: f32,
@@ -956,6 +1476,9 @@ impl App {
         self.last_frame = now;
 
         if !self.is_transitioning {
+            if self.config.profiling {
+                self.request_redraw();
+            }
             return;
         }
 
@@ -963,7 +1486,7 @@ impl App {
 
         let end_dur = match self.config.transition_type {
             TransitionType::Slide => self.config.transition_duration,
-            _ => self.config.blur_duration,
+            _ => self.config.transition_duration,
         };
         if self.transition_time >= end_dur {
             self.is_transitioning = false;
@@ -971,10 +1494,14 @@ impl App {
     }
 
     pub fn render(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        drop(self.previous_frame.take());
+
+        let _t0 = Instant::now();
         let res = &mut self.resources;
 
         let (image_index, _is_suboptimal, acquire_future) =
             vulkano::swapchain::acquire_next_image(res.swapchain.clone(), None)?;
+        let _t1 = Instant::now();
 
         let t = self.transition_time;
         let new_alpha = if self.is_transitioning {
@@ -983,13 +1510,8 @@ impl App {
         } else {
             1.0
         };
-        let ghost_strength = if self.is_transitioning {
-            1.0 - (t / self.config.blur_duration).min(1.0)
-        } else {
-            0.0
-        };
-        let blur_radius = if self.is_transitioning {
-            (t / self.config.blur_duration).min(1.0) * self.config.blur_radius_max
+        let blur_radius = if self.is_transitioning && self.config.transition_type == TransitionType::Smooth {
+            self.config.blur_radius_max
         } else {
             0.0
         };
@@ -1005,17 +1527,14 @@ impl App {
             (0.0, 0.0)
         };
 
-        let pc = PushConstantData {
+        let pc = PushConstants {
             current_layer: self.current_layer as i32,
             previous_layer: self.previous_layer as i32,
             new_alpha,
-            ghost_strength,
             blur_radius,
             slide_offset_x,
             slide_offset_y,
         };
-
-        let image_view = &res.swapchain_image_views[image_index as usize];
 
         let extent = res._swapchain_images[image_index as usize].extent();
         let viewport = Viewport {
@@ -1034,32 +1553,125 @@ impl App {
             CommandBufferUsage::OneTimeSubmit,
         )?;
 
-        builder
-            .begin_rendering(RenderingInfo {
-                color_attachments: vec![Some(RenderingAttachmentInfo {
-                    load_op: AttachmentLoadOp::Clear,
-                    store_op: AttachmentStoreOp::Store,
-                    clear_value: Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0])),
-                    ..RenderingAttachmentInfo::image_view(image_view.clone())
-                })],
-                ..Default::default()
-            })?
-            .bind_pipeline_graphics(res.pipeline.clone())?
-            .set_viewport(0, smallvec![viewport])?
-            .set_scissor(0, smallvec![scissor])?
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                res.pipeline_layout.clone(),
-                0,
-                res.descriptor_set.clone(),
-            )?
-            .push_constants(res.pipeline_layout.clone(), 0, pc)?;
-        unsafe {
-            builder.draw(3, 1, 0, 0)?;
+        if self.config.transition_type == TransitionType::Smooth && self.is_transitioning {
+            let idx = self.feedback_idx;
+            let out_idx = 1 - idx;
+
+            // Pass 1: Blend current slide onto input feedback
+            builder
+                .begin_rendering(RenderingInfo {
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Load,
+                        store_op: AttachmentStoreOp::Store,
+                        clear_value: None,
+                        image_layout: ImageLayout::General,
+                        ..RenderingAttachmentInfo::image_view(res.feedback_view[idx].clone())
+                    })],
+                    ..Default::default()
+                })?
+                .bind_pipeline_graphics(res.blend_pipeline.clone())?
+                .set_viewport(0, smallvec![viewport.clone()])?
+                .set_scissor(0, smallvec![scissor.clone()])?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    res.blend_pipeline_layout.clone(),
+                    0,
+                    res.slides_descriptor_set.clone(),
+                )?
+                .push_constants(res.blend_pipeline_layout.clone(), 0, pc)?;
+            unsafe { builder.draw(3, 1, 0, 0)?; }
+            builder.end_rendering()?;
+
+            // Pass 2: Horizontal blur (feedback → ping)
+            builder
+                .bind_pipeline_compute(res.blur_h_pipeline.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    res.blur_pipeline_layout.clone(),
+                    0,
+                    res.blur_h_descriptor_set[idx].clone(),
+                )?
+                .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
+            unsafe {
+                builder.dispatch([
+                    (extent[0] + 15) / 16,
+                    (extent[1] + 15) / 16,
+                    1,
+                ])?;
+            }
+
+            // Pass 3: Vertical blur (ping → output feedback)
+            builder
+                .bind_pipeline_compute(res.blur_v_pipeline.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    res.blur_pipeline_layout.clone(),
+                    0,
+                    res.blur_v_descriptor_set[idx].clone(),
+                )?
+                .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
+            unsafe {
+                builder.dispatch([
+                    (extent[0] + 15) / 16,
+                    (extent[1] + 15) / 16,
+                    1,
+                ])?;
+            }
+
+            // Pass 4: Present output feedback + current slide to swapchain
+            builder
+                .begin_rendering(RenderingInfo {
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Clear,
+                        store_op: AttachmentStoreOp::Store,
+                        clear_value: Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0])),
+                        ..RenderingAttachmentInfo::image_view(res.swapchain_image_views[image_index as usize].clone())
+                    })],
+                    ..Default::default()
+                })?
+                .bind_pipeline_graphics(res.present_pipeline.clone())?
+                .set_viewport(0, smallvec![viewport])?
+                .set_scissor(0, smallvec![scissor])?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    res.present_pipeline_layout.clone(),
+                    0,
+                    res.present_descriptor_set[idx].clone(),
+                )?
+                .push_constants(res.present_pipeline_layout.clone(), 0, pc)?;
+            unsafe { builder.draw(3, 1, 0, 0)?; }
+            builder.end_rendering()?;
+
+            // Swap feedback buffers for next frame
+            self.feedback_idx = out_idx;
+        } else {
+            // Direct rendering: Instant, Slide, or non-transitioning
+            builder
+                .begin_rendering(RenderingInfo {
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Clear,
+                        store_op: AttachmentStoreOp::Store,
+                        clear_value: Some(ClearValue::Float([0.0, 0.0, 0.0, 1.0])),
+                        ..RenderingAttachmentInfo::image_view(res.swapchain_image_views[image_index as usize].clone())
+                    })],
+                    ..Default::default()
+                })?
+                .bind_pipeline_graphics(res.direct_pipeline.clone())?
+                .set_viewport(0, smallvec![viewport])?
+                .set_scissor(0, smallvec![scissor])?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    res.direct_pipeline_layout.clone(),
+                    0,
+                    res.slides_descriptor_set.clone(),
+                )?
+                .push_constants(res.direct_pipeline_layout.clone(), 0, pc)?;
+            unsafe { builder.draw(3, 1, 0, 0)?; }
+            builder.end_rendering()?;
         }
-        builder.end_rendering()?;
 
         let command_buffer = builder.build()?;
+        let _t2 = Instant::now();
 
         let future: Box<dyn GpuFuture> = Box::new(
             acquire_future
@@ -1073,12 +1685,29 @@ impl App {
                 )
                 .then_signal_fence_and_flush()?,
         );
-
-        if let Some(ref mut prev) = self.previous_frame {
-            prev.cleanup_finished();
-        }
+        let _t3 = Instant::now();
 
         self.previous_frame = Some(future);
+        let _t4 = Instant::now();
+
+        if self.config.profiling {
+            self.frame_count += 1;
+            let now = Instant::now();
+            let since_last_log = now.duration_since(self.last_fps_print);
+            if since_last_log.as_secs_f32() >= 1.0 {
+                println!(
+                    "FPS: {:.1} | acquire: {:.3}ms | build_cb: {:.3}ms | submit: {:.3}ms | store_prev: {:.3}ms | total: {:.3}ms",
+                    self.frame_count as f32 / since_last_log.as_secs_f32().max(0.001),
+                    (_t1 - _t0).as_secs_f32() * 1000.0,
+                    (_t2 - _t1).as_secs_f32() * 1000.0,
+                    (_t3 - _t2).as_secs_f32() * 1000.0,
+                    (_t4 - _t3).as_secs_f32() * 1000.0,
+                    (_t4 - _t0).as_secs_f32() * 1000.0,
+                );
+                self.frame_count = 0;
+                self.last_fps_print = now;
+            }
+        }
 
         Ok(())
     }
@@ -1093,49 +1722,32 @@ mod tests {
         u * u * (3.0 - 2.0 * u)
     }
 
-    fn compute_ghost(t: f32, blur_dur: f32) -> f32 {
-        1.0 - (t / blur_dur).min(1.0)
-    }
-
-    fn compute_blur(t: f32, blur_dur: f32, max_radius: f32) -> f32 {
-        (t / blur_dur).min(1.0) * max_radius
+    fn compute_blur(t: f32, blur_dur: f32) -> f32 {
+        if t >= blur_dur { 0.0 } else { 20.0 }
     }
 
     #[test]
     fn transition_params_t0() {
         assert_eq!(compute_new_alpha(0.0, 0.5), 0.0);
-        assert_eq!(compute_ghost(0.0, 10.0), 1.0);
-        assert_eq!(compute_blur(0.0, 10.0, 20.0), 0.0);
+        assert_eq!(compute_blur(0.0, 0.5), 20.0);
     }
 
     #[test]
     fn transition_params_t0_25() {
         let a = compute_new_alpha(0.25, 0.5);
         assert!(a > 0.0 && a < 1.0);
-        let g = compute_ghost(0.25, 10.0);
-        assert!((g - 0.975).abs() < 0.001);
-        assert!((compute_blur(0.25, 10.0, 20.0) - 0.5).abs() < 0.001);
     }
 
     #[test]
     fn transition_params_t0_5() {
         assert!((compute_new_alpha(0.5, 0.5) - 1.0).abs() < 0.001);
-        let g = compute_ghost(0.5, 10.0);
-        assert!((g - 0.95).abs() < 0.001);
     }
 
     #[test]
     fn transition_params_t10() {
         assert!((compute_new_alpha(10.0, 0.5) - 1.0).abs() < 0.001);
-        assert!((compute_ghost(10.0, 10.0) - 0.0).abs() < 0.001);
-        assert!((compute_blur(10.0, 10.0, 20.0) - 20.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn transition_custom_durations() {
-        assert!((compute_new_alpha(0.1, 0.2) - 0.5).abs() < 0.001);
-        assert!((compute_ghost(2.5, 5.0) - 0.5).abs() < 0.001);
-        assert!((compute_blur(5.0, 5.0, 30.0) - 30.0).abs() < 0.001);
+        // Blur stops when not transitioning
+        assert!((compute_blur(10.0, 0.5) - 0.0).abs() < 0.001);
     }
 
     #[test]
@@ -1218,11 +1830,10 @@ mod tests {
 
     #[test]
     fn slide_ease_out_midway() {
-        let u = 5.0 / 10.0; // halfway
+        let u = 5.0 / 10.0;
         let ease_out = 1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u);
         let (ox, oy) = compute_slide_offset(5.0, 10.0, (0.0, 1.0));
         assert!((ox - 0.0).abs() < 0.001);
-        // At halfway, ease_out = 0.875, offset = 1.0 * (1-0.875) = 0.125
         assert!((oy - (1.0 - ease_out)).abs() < 0.001);
     }
 
@@ -1232,27 +1843,109 @@ mod tests {
         assert_eq!(TransitionType::Instant, TransitionType::Instant);
         assert_eq!(TransitionType::Slide, TransitionType::Slide);
         assert_ne!(TransitionType::Smooth, TransitionType::Instant);
-        assert_ne!(TransitionType::Smooth, TransitionType::Slide);
-        assert_ne!(TransitionType::Instant, TransitionType::Slide);
+    }
+
+    #[test]
+    fn parse_args_default_config() {
+        let config = parse_args(&["program".into(), "/slides".into()]);
+        assert!(config.is_some());
+        let cfg = config.unwrap();
+        assert_eq!(cfg.slides_path, std::path::PathBuf::from("/slides"));
+        assert!((cfg.blur_radius_max - 20.0).abs() < 1e-6);
+        assert!((cfg.transition_duration - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_args_custom_values() {
+        let args: Vec<String> = vec![
+            "program".into(), "/slides".into(),
+            "--blur-radius".into(), "30.0".into(),
+            "--transition-duration".into(), "1.0".into(),
+        ];
+        let config = parse_args(&args);
+        assert!(config.is_some());
+        let cfg = config.unwrap();
+        assert!((cfg.blur_radius_max - 30.0).abs() < 1e-6);
+        assert!((cfg.transition_duration - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_args_transition_type_instant2() {
+        let config = parse_args(&[
+            "program".into(), "/slides".into(),
+            "--transition-type".into(), "instant".into(),
+        ]);
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().transition_type, TransitionType::Instant);
+    }
+
+    #[test]
+    fn parse_args_transition_type_smooth_explicit() {
+        let config = parse_args(&[
+            "program".into(), "/slides".into(),
+            "--transition-type".into(), "smooth".into(),
+        ]);
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().transition_type, TransitionType::Smooth);
+    }
+
+    #[test]
+    fn parse_args_transition_type_default() {
+        let config = parse_args(&["program".into(), "/slides".into()]);
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().transition_type, TransitionType::Smooth);
     }
 
     #[test]
     fn parse_args_transition_type_slide() {
-        let args = vec![
-            "rs-vulkan".to_string(),
-            "/path/to/slides".to_string(),
-            "--transition-type".to_string(),
-            "slide".to_string(),
-        ];
-        let config = parse_args(&args).unwrap();
-        assert_eq!(config.transition_type, TransitionType::Slide);
+        let config = parse_args(&[
+            "program".into(), "/slides".into(),
+            "--transition-type".into(), "slide".into(),
+        ]);
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().transition_type, TransitionType::Slide);
     }
 
     #[test]
-    fn app_initial_direction_zero() {
-        let _config = AppConfig {
-            transition_type: TransitionType::Slide,
-            ..AppConfig::default()
-        };
+    fn parse_args_transition_type_invalid2() {
+        assert!(parse_args(&[
+            "program".into(), "/slides".into(),
+            "--transition-type".into(), "bogus".into(),
+        ]).is_none());
+    }
+
+    #[test]
+    fn parse_args_help_returns_none() {
+        assert!(parse_args(&["program".into(), "--help".into()]).is_none());
+    }
+
+    #[test]
+    fn parse_args_no_args_returns_none() {
+        assert!(parse_args(&["program".into()]).is_none());
+    }
+
+    #[test]
+    fn parse_args_unknown_option_returns_none() {
+        assert!(parse_args(&["program".into(), "/slides".into(), "--bogus".into()]).is_none());
+    }
+
+    #[test]
+    fn parse_args_invalid_number_returns_none() {
+        assert!(parse_args(&["program".into(), "/slides".into(), "--blur-radius".into(), "abc".into()]).is_none());
+    }
+
+    #[test]
+    fn parse_args_init_returns_none() {
+        let dir = tempfile::TempDir::with_prefix("init_test").unwrap();
+        let path = dir.path().join("example");
+        let result = parse_args(&["program".into(), "init".into(), path.to_string_lossy().into()]);
+        assert!(result.is_none());
+        assert!(path.join("presenter_notes.md").exists());
+    }
+
+    #[test]
+    fn parse_args_init_missing_path_returns_none() {
+        let result = parse_args(&["program".into(), "init".into()]);
+        assert!(result.is_none());
     }
 }
