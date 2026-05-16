@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => {
                     if let Some(app) = &mut slide_app {
                         let changed = match keycode {
-                            KeyCode::Escape => {
+                            KeyCode::Escape | KeyCode::KeyQ => {
                                 elwt.exit();
                                 false
                             }
