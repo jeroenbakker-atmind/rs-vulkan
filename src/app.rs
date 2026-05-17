@@ -87,8 +87,8 @@ layout(push_constant) uniform PC {
 layout(set = 0, binding = 0) uniform sampler2DArray slides;
 
 void main() {
-    vec3 slide = texture(slides, vec3(v_uv, pc.current_layer)).rgb;
-    f_color = vec4(slide, pc.new_alpha);
+    vec4 slide = texture(slides, vec3(v_uv, pc.current_layer));
+    f_color = vec4(slide.rgb * slide.a * pc.new_alpha, pc.new_alpha);
 }
 ",
     }
@@ -191,23 +191,11 @@ mod fs_present {
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 f_color;
 
-layout(push_constant) uniform PC {
-    int   current_layer;
-    int   previous_layer;
-    float new_alpha;
-    float blur_radius;
-    float slide_offset_x;
-    float slide_offset_y;
-} pc;
-
 layout(set = 0, binding = 0) uniform sampler2D feedback;
-layout(set = 0, binding = 1) uniform sampler2DArray slides;
 
 void main() {
     vec3 fb = texture(feedback, v_uv).rgb;
-    vec3 slide = texture(slides, vec3(v_uv, pc.current_layer)).rgb;
-    vec3 result = mix(fb, slide, pc.new_alpha);
-    f_color = vec4(result, 1.0);
+    f_color = vec4(fb, 1.0);
 }
 ",
     }
@@ -267,7 +255,6 @@ pub enum TransitionType {
 pub struct AppConfig {
     pub slides_path: std::path::PathBuf,
     pub transition_type: TransitionType,
-    pub blur_radius_max: f32,
     pub transition_duration: f32,
     pub profiling: bool,
 }
@@ -277,7 +264,6 @@ impl Default for AppConfig {
         Self {
             slides_path: std::path::PathBuf::new(),
             transition_type: TransitionType::Smooth,
-            blur_radius_max: 20.0,
             transition_duration: 0.5,
             profiling: false,
         }
@@ -298,7 +284,6 @@ Commands:
 
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
-  --blur-radius <px>           Max Gaussian blur radius (smooth only; default: 20.0)
   --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
   --profile                    Print per-frame timing breakdown every second
   --help                       Show this help
@@ -347,10 +332,6 @@ pub fn parse_args(args: &[String]) -> Option<AppConfig> {
                         return None;
                     }
                 };
-            }
-            "--blur-radius" => {
-                i += 1;
-                config.blur_radius_max = args.get(i)?.parse().ok()?;
             }
             "--transition-duration" => {
                 i += 1;
@@ -415,7 +396,7 @@ pub fn init_example_presentation(path: &std::path::Path) {
                 SlideDef {
                     num: 1,
                     name: "Configuration",
-                    notes: "Customize the viewing experience:\n\n- `--blur-radius`: Max Gaussian blur during transitions\n- `--transition-duration`: Transition timing\n\nDefault values work well for most presentations.",
+                    notes: "Customize the viewing experience:\n\n- `--transition-duration`: Transition timing\n\nDefault values work well for most presentations.",
                 },
                 SlideDef {
                     num: 2,
@@ -515,19 +496,19 @@ pub struct GpuResources {
     // Slides sampler descriptor set (shared by direct and blend pipelines)
     pub slides_descriptor_set: Arc<DescriptorSet>,
 
-    // Feedback textures
-    pub feedback: [Arc<Image>; 2],
-    pub feedback_view: [Arc<ImageView>; 2],
+    // Feedback texture (single buffer, blurred in-place via ping)
+    pub feedback: Arc<Image>,
+    pub feedback_view: Arc<ImageView>,
     pub ping_image: Arc<Image>,
     pub ping_view: Arc<ImageView>,
     pub sampler: Arc<Sampler>,
 
-    // Present descriptor sets (one per feedback texture)
-    pub present_descriptor_set: [Arc<DescriptorSet>; 2],
+    // Present descriptor set (renders feedback to swapchain)
+    pub present_descriptor_set: Arc<DescriptorSet>,
 
     // Blur descriptor sets
-    pub blur_h_descriptor_set: [Arc<DescriptorSet>; 2], // [src=fb[0]→ping, src=fb[1]→ping]
-    pub blur_v_descriptor_set: [Arc<DescriptorSet>; 2], // [src=ping→fb[0], src=ping→fb[1]]
+    pub blur_h_descriptor_set: Arc<DescriptorSet>, // feedback → ping
+    pub blur_v_descriptor_set: Arc<DescriptorSet>, // ping → feedback
 
     pub _format: Format,
     pub window: Arc<winit::window::Window>,
@@ -544,7 +525,6 @@ pub struct App {
     pub config: AppConfig,
     pub last_frame: Instant,
     pub transition_direction: (f32, f32),
-    feedback_idx: usize,
     frame_count: u64,
     last_fps_print: Instant,
     previous_frame: Option<Box<dyn GpuFuture>>,
@@ -870,11 +850,9 @@ pub fn create_app(
     let scene_extent = swapchain_images[0].extent();
     let extent2 = [scene_extent[0], scene_extent[1]];
 
-    // Create feedback textures (ping-pong pair) and intermediate ping buffer
-    let feedback_img_0 = create_feedback_image(&memory_allocator, extent2)?;
-    let feedback_img_1 = create_feedback_image(&memory_allocator, extent2)?;
-    let feedback_view_0 = create_feedback_view(feedback_img_0.clone())?;
-    let feedback_view_1 = create_feedback_view(feedback_img_1.clone())?;
+    // Create single feedback texture and intermediate ping buffer
+    let feedback_img = create_feedback_image(&memory_allocator, extent2)?;
+    let feedback_view = create_feedback_view(feedback_img.clone())?;
 
     let ping_image = Image::new(
         memory_allocator.clone() as Arc<dyn vulkano::memory::allocator::MemoryAllocator>,
@@ -1026,7 +1004,7 @@ pub fn create_app(
                     1,
                     ColorBlendAttachmentState {
                         blend: Some(AttachmentBlend {
-                            src_color_blend_factor: BlendFactor::SrcAlpha,
+                            src_color_blend_factor: BlendFactor::One,
                             dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
                             color_blend_op: BlendOp::Add,
                             src_alpha_blend_factor: BlendFactor::One,
@@ -1048,17 +1026,12 @@ pub fn create_app(
         )
         .map_err(|e| format!("blend_pipeline: {e}"))?;
 
-    // Present pipeline (smooth, draws feedback + slide to swapchain)
+    // Present pipeline (renders feedback to swapchain)
     let present_descriptor_set_layout = DescriptorSetLayout::new(
         device.clone(),
         DescriptorSetLayoutCreateInfo {
             bindings: std::collections::BTreeMap::from([
                 (0u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::FRAGMENT,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
-                }),
-                (1u32, DescriptorSetLayoutBinding {
                     descriptor_count: 1,
                     stages: vulkano::shader::ShaderStages::FRAGMENT,
                     ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
@@ -1072,42 +1045,27 @@ pub fn create_app(
         device.clone(),
         PipelineLayoutCreateInfo {
             set_layouts: vec![present_descriptor_set_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::FRAGMENT,
-                offset: 0,
-                size: 24,
-            }],
             ..Default::default()
         },
     )?;
 
-    // Create present descriptor sets (one per feedback texture)
-    let make_present_set = |feedback_view: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
-        DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            present_descriptor_set_layout.clone(),
-            [
-                WriteDescriptorSet::image_view_with_layout_sampler(
-                    0,
-                    DescriptorImageViewInfo {
-                        image_view: feedback_view,
-                        image_layout: ImageLayout::General,
-                    },
-                    sampler.clone(),
-                ),
-                WriteDescriptorSet::image_view_sampler(
-                    1,
-                    texture_view.clone(),
-                    sampler.clone(),
-                ),
-            ],
-            [],
-        )
-        .map_err(|e| format!("present descriptor_set: {e}").into())
-    };
-
-    let present_set_0 = make_present_set(feedback_view_0.clone())?;
-    let present_set_1 = make_present_set(feedback_view_1.clone())?;
+    // Create present descriptor set (reads feedback, outputs to swapchain)
+    let present_set = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        present_descriptor_set_layout.clone(),
+        [
+            WriteDescriptorSet::image_view_with_layout_sampler(
+                0,
+                DescriptorImageViewInfo {
+                    image_view: feedback_view.clone(),
+                    image_layout: ImageLayout::General,
+                },
+                sampler.clone(),
+            ),
+        ],
+        [],
+    )
+    .map_err(|e| format!("present descriptor_set: {e}"))?;
 
     let present_pipeline =
         vulkano::pipeline::graphics::GraphicsPipeline::new(
@@ -1223,7 +1181,7 @@ pub fn create_app(
         },
     )?;
 
-    // Create blur descriptor sets for both permutations
+    // Create blur descriptor sets (feedback → ping, ping → feedback)
     let make_blur_set = |src: Arc<ImageView>, dst: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
         DescriptorSet::new(
             descriptor_set_allocator.clone(),
@@ -1249,10 +1207,8 @@ pub fn create_app(
         .map_err(|e| format!("blur descriptor_set: {e}").into())
     };
 
-    let blur_h_set_0 = make_blur_set(feedback_view_0.clone(), ping_view.clone())?;
-    let blur_h_set_1 = make_blur_set(feedback_view_1.clone(), ping_view.clone())?;
-    let blur_v_set_0 = make_blur_set(ping_view.clone(), feedback_view_0.clone())?;
-    let blur_v_set_1 = make_blur_set(ping_view.clone(), feedback_view_1.clone())?;
+    let blur_h_set = make_blur_set(feedback_view.clone(), ping_view.clone())?;
+    let blur_v_set = make_blur_set(ping_view.clone(), feedback_view.clone())?;
 
     let blur_h_pipeline = ComputePipeline::new(
         device.clone(),
@@ -1298,14 +1254,14 @@ pub fn create_app(
             present_pipeline,
             present_pipeline_layout,
             slides_descriptor_set,
-            feedback: [feedback_img_0, feedback_img_1],
-            feedback_view: [feedback_view_0, feedback_view_1],
+            feedback: feedback_img,
+            feedback_view,
             ping_image,
             ping_view,
             sampler,
-            present_descriptor_set: [present_set_0, present_set_1],
-            blur_h_descriptor_set: [blur_h_set_0, blur_h_set_1],
-            blur_v_descriptor_set: [blur_v_set_0, blur_v_set_1],
+            present_descriptor_set: present_set,
+            blur_h_descriptor_set: blur_h_set,
+            blur_v_descriptor_set: blur_v_set,
             _format: format,
             window,
         },
@@ -1316,7 +1272,6 @@ pub fn create_app(
         transition_time: 0.0,
         is_transitioning: false,
         transition_direction: (0.0, 0.0),
-        feedback_idx: 0,
         frame_count: 0,
         last_fps_print: Instant::now(),
         config,
@@ -1476,7 +1431,7 @@ impl App {
         self.last_frame = now;
 
         if !self.is_transitioning {
-            if self.config.profiling {
+            if self.config.profiling || self.config.transition_type == TransitionType::Smooth {
                 self.request_redraw();
             }
             return;
@@ -1490,6 +1445,7 @@ impl App {
         };
         if self.transition_time >= end_dur {
             self.is_transitioning = false;
+            self.previous_layer = self.current_layer;
         }
     }
 
@@ -1510,8 +1466,8 @@ impl App {
         } else {
             1.0
         };
-        let blur_radius = if self.is_transitioning && self.config.transition_type == TransitionType::Smooth {
-            self.config.blur_radius_max
+        let blur_radius = if self.config.transition_type == TransitionType::Smooth {
+            20.0
         } else {
             0.0
         };
@@ -1553,11 +1509,47 @@ impl App {
             CommandBufferUsage::OneTimeSubmit,
         )?;
 
-        if self.config.transition_type == TransitionType::Smooth && self.is_transitioning {
-            let idx = self.feedback_idx;
-            let out_idx = 1 - idx;
+        if self.config.transition_type == TransitionType::Smooth {
+            // Pass 1: Horizontal blur (feedback → ping)
+            builder
+                .bind_pipeline_compute(res.blur_h_pipeline.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    res.blur_pipeline_layout.clone(),
+                    0,
+                    res.blur_h_descriptor_set.clone(),
+                )?
+                .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
+            unsafe {
+                builder.dispatch([
+                    (extent[0] + 15) / 16,
+                    (extent[1] + 15) / 16,
+                    1,
+                ])?;
+            }
 
-            // Pass 1: Blend current slide onto input feedback
+            // Pass 2: Vertical blur (ping → feedback)
+            builder
+                .bind_pipeline_compute(res.blur_v_pipeline.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    res.blur_pipeline_layout.clone(),
+                    0,
+                    res.blur_v_descriptor_set.clone(),
+                )?
+                .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
+            unsafe {
+                builder.dispatch([
+                    (extent[0] + 15) / 16,
+                    (extent[1] + 15) / 16,
+                    1,
+                ])?;
+            }
+
+            // Memory barrier: blur compute writes finished → blend render pass reads
+            // (vulkano handles this via subpass dependencies / automatic barrier tracking)
+
+            // Pass 3: Blend current slide onto feedback
             builder
                 .begin_rendering(RenderingInfo {
                     color_attachments: vec![Some(RenderingAttachmentInfo {
@@ -1565,7 +1557,7 @@ impl App {
                         store_op: AttachmentStoreOp::Store,
                         clear_value: None,
                         image_layout: ImageLayout::General,
-                        ..RenderingAttachmentInfo::image_view(res.feedback_view[idx].clone())
+                        ..RenderingAttachmentInfo::image_view(res.feedback_view.clone())
                     })],
                     ..Default::default()
                 })?
@@ -1582,43 +1574,7 @@ impl App {
             unsafe { builder.draw(3, 1, 0, 0)?; }
             builder.end_rendering()?;
 
-            // Pass 2: Horizontal blur (feedback → ping)
-            builder
-                .bind_pipeline_compute(res.blur_h_pipeline.clone())?
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    res.blur_pipeline_layout.clone(),
-                    0,
-                    res.blur_h_descriptor_set[idx].clone(),
-                )?
-                .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
-            unsafe {
-                builder.dispatch([
-                    (extent[0] + 15) / 16,
-                    (extent[1] + 15) / 16,
-                    1,
-                ])?;
-            }
-
-            // Pass 3: Vertical blur (ping → output feedback)
-            builder
-                .bind_pipeline_compute(res.blur_v_pipeline.clone())?
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    res.blur_pipeline_layout.clone(),
-                    0,
-                    res.blur_v_descriptor_set[idx].clone(),
-                )?
-                .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
-            unsafe {
-                builder.dispatch([
-                    (extent[0] + 15) / 16,
-                    (extent[1] + 15) / 16,
-                    1,
-                ])?;
-            }
-
-            // Pass 4: Present output feedback + current slide to swapchain
+            // Pass 4: Present feedback to swapchain
             builder
                 .begin_rendering(RenderingInfo {
                     color_attachments: vec![Some(RenderingAttachmentInfo {
@@ -1636,14 +1592,10 @@ impl App {
                     PipelineBindPoint::Graphics,
                     res.present_pipeline_layout.clone(),
                     0,
-                    res.present_descriptor_set[idx].clone(),
-                )?
-                .push_constants(res.present_pipeline_layout.clone(), 0, pc)?;
+                    res.present_descriptor_set.clone(),
+                )?;
             unsafe { builder.draw(3, 1, 0, 0)?; }
             builder.end_rendering()?;
-
-            // Swap feedback buffers for next frame
-            self.feedback_idx = out_idx;
         } else {
             // Direct rendering: Instant, Slide, or non-transitioning
             builder

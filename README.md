@@ -16,7 +16,6 @@ Commands:
 
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
-  --blur-radius <px>           Max Gaussian blur radius (smooth only; default: 20.0)
   --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
   --profile                    Print per-frame timing breakdown every second
   --help                       Show this help
@@ -40,9 +39,6 @@ rs-vulkan my-talk --transition-type slide --transition-duration 3
 
 # Instant cuts (no animation)
 rs-vulkan my-talk --transition-type instant
-
-# Smooth with heavier blur
-rs-vulkan my-talk --blur-radius 40
 
 # Combine slide transition with custom timing
 rs-vulkan my-talk --transition-type slide --transition-duration 2
@@ -121,7 +117,7 @@ struct PushConstants {
 
 | Type      | Description                                       | Config parameters            |
 |-----------|---------------------------------------------------|------------------------------|
-| `smooth`  | Compute-shader Gaussian blur + feedback ping-pong | `blur-radius`                |
+| `smooth`  | Compute-shader Gaussian blur + feedback ping-pong | (none)                       |
 | `instant` | Immediate cut, no animation                       | (none)                       |
 | `slide`   | Slide new slide in with cubic ease-out            | `transition-duration`        |
 
@@ -134,7 +130,7 @@ Uses a two-texture feedback loop. Each frame during the transition:
 3. The output feedback is drawn to the swapchain, with the target slide blended on top
 4. The feedback textures are swapped for next frame
 
-The blur radius is constant (`--blur-radius`) during the transition. Because the blur is applied every frame, old content progressively blurs out via the IIR feedback loop while the new slide becomes dominant through continuous alpha blending.
+The blur radius is constant during the transition. Because the blur is applied every frame, old content progressively blurs out via the IIR feedback loop while the new slide becomes dominant through continuous alpha blending.
 
 ### `instant`
 

@@ -51,12 +51,12 @@ fn transition_params_t0_5() {
     assert!((compute_new_alpha(0.5, 0.5) - 1.0).abs() < 0.001);
 }
 
-/// UC-5 steps 6-7: after the transition completes, the blend factor stays at
-/// 1 and the blur radius drops to 0.
+/// UC-5: after the transition completes, the blend factor stays at 1 and
+/// the blur continues running.
 #[test]
 fn transition_params_t10() {
     assert!((compute_new_alpha(10.0, 0.5) - 1.0).abs() < 0.001);
-    assert!((compute_blur(10.0, 0.5) - 0.0).abs() < 0.001);
+    assert!((compute_blur(10.0, 0.5) - 20.0).abs() < 0.001);
 }
 
 /// UC-5 step 2: the smoothstep S-curve has increasing increments (convex then
@@ -67,34 +67,6 @@ fn transition_smoothstep_shape() {
     let a2 = compute_new_alpha(0.25, 0.5);
     let a3 = compute_new_alpha(0.375, 0.5);
     assert!((a2 - a1 - (a3 - a2)).abs() < 0.001);
-}
-
-/// UC-5: an invalid numeric value for `--blur-radius` is rejected.
-#[test]
-fn parse_args_invalid_number_returns_none() {
-    assert!(app::parse_args(&["program".into(), "/slides".into(), "--blur-radius".into(), "abc".into()]).is_none());
-}
-
-/// UC-5: a negative `--blur-radius` is accepted.
-#[test]
-fn parse_args_negative_blur_radius() {
-    let config = app::parse_args(&[
-        "program".into(), "/slides".into(),
-        "--blur-radius".into(), "-5.0".into(),
-    ]);
-    assert!(config.is_some());
-    assert!((config.unwrap().blur_radius_max - (-5.0)).abs() < 1e-6);
-}
-
-/// UC-5: a zero `--blur-radius` is accepted.
-#[test]
-fn parse_args_zero_blur_radius() {
-    let config = app::parse_args(&[
-        "program".into(), "/slides".into(),
-        "--blur-radius".into(), "0".into(),
-    ]);
-    assert!(config.is_some());
-    assert!((config.unwrap().blur_radius_max - 0.0).abs() < 1e-6);
 }
 
 /// UC-5: a zero `--transition-duration` is accepted.
@@ -108,11 +80,9 @@ fn parse_args_zero_transition_duration() {
     assert!((config.unwrap().transition_duration - 0.0).abs() < 1e-6);
 }
 
-/// UC-5: a flag with no following value (e.g. `--blur-radius` at end of
-/// args) is rejected.
+/// UC-5: a flag with no following value is rejected.
 #[test]
 fn parse_args_missing_value_after_flag() {
-    assert!(app::parse_args(&["program".into(), "/slides".into(), "--blur-radius".into()]).is_none());
     assert!(app::parse_args(&["program".into(), "/slides".into(), "--transition-duration".into()]).is_none());
 }
 
@@ -131,7 +101,6 @@ fn parse_args_default_config() {
     assert!(config.is_some());
     let cfg = config.unwrap();
     assert_eq!(cfg.slides_path, std::path::PathBuf::from("/slides"));
-    assert!((cfg.blur_radius_max - 20.0).abs() < 1e-6);
     assert!((cfg.transition_duration - 0.5).abs() < 1e-6);
 }
 

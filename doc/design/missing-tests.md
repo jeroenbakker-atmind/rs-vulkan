@@ -45,7 +45,6 @@ Tests requiring an `App` instance or `GpuResources` need a Vulkan device and can
 
 | Missing | What is untested |
 |---------|------------------|
-| `--blur-radius` without `--transition-type smooth` | Parser accepts blur-radius with any transition type. Not tested. |
 
 ## Integration / Cross-cutting
 

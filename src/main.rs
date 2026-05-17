@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(app) = &mut slide_app {
                     let was_transitioning = app.is_transitioning;
                     app.update();
-                    if was_transitioning || app.is_transitioning {
+                    if was_transitioning || app.is_transitioning || app.config.transition_type == app::TransitionType::Smooth {
                         app.request_redraw();
                     }
                 }

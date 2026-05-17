@@ -14,19 +14,16 @@ fn parse_args_transition_type_slide() {
     assert_eq!(config.unwrap().transition_type, TransitionType::Slide);
 }
 
-/// UC-4 precondition: `--blur-radius` and `--transition-duration` custom
-/// values are accepted.
+/// UC-4 precondition: `--transition-duration` custom value is accepted.
 #[test]
 fn parse_args_custom_values() {
     let args: Vec<String> = vec![
         "program".into(), "/slides".into(),
-        "--blur-radius".into(), "30.0".into(),
         "--transition-duration".into(), "1.0".into(),
     ];
     let config = app::parse_args(&args);
     assert!(config.is_some());
     let cfg = config.unwrap();
-    assert!((cfg.blur_radius_max - 30.0).abs() < 1e-6);
     assert!((cfg.transition_duration - 1.0).abs() < 1e-6);
 }
 

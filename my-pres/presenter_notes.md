@@ -25,7 +25,6 @@ Navigate with arrow keys and Escape to quit.
 ## 2_1: Configuration
 Customize the viewing experience:
 
-- `--blur-radius`: Max Gaussian blur radius (compute shader)
 - `--transition-duration`: Transition timing for slide mode
 - `--profile`: Print per-frame timing breakdown
 

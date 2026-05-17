@@ -57,9 +57,9 @@ pub fn compute_new_alpha(t: f32, fade_dur: f32) -> f32 {
 }
 
 /// The blur radius during a smooth transition: returns the configured max
-/// radius while transitioning, 0 otherwise.
-pub fn compute_blur(t: f32, blur_dur: f32) -> f32 {
-    if t >= blur_dur { 0.0 } else { 20.0 }
+/// radius continuously (blur never stops).
+pub fn compute_blur(_t: f32, _blur_dur: f32) -> f32 {
+    20.0
 }
 
 /// The slide offset for slide transitions. Uses cubic ease-out:
