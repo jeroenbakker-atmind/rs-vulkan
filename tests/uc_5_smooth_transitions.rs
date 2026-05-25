@@ -86,14 +86,6 @@ fn parse_args_missing_value_after_flag() {
     assert!(app::parse_args(&["program".into(), "/slides".into(), "--transition-duration".into()]).is_none());
 }
 
-/// UC-2: `--profile` flag is accepted by parse_args and sets profiling mode.
-#[test]
-fn parse_args_profile() {
-    let config = app::parse_args(&["program".into(), "/slides".into(), "--profile".into()]);
-    assert!(config.is_some());
-    assert!(config.unwrap().profiling);
-}
-
 /// UC-2 step 1: `rs-vulkan <path>` with default options is accepted.
 #[test]
 fn parse_args_default_config() {

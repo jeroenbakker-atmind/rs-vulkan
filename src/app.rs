@@ -275,7 +275,6 @@ pub struct AppConfig {
     pub slides_path: std::path::PathBuf,
     pub transition_type: TransitionType,
     pub transition_duration: f32,
-    pub profiling: bool,
 }
 
 impl Default for AppConfig {
@@ -284,7 +283,6 @@ impl Default for AppConfig {
             slides_path: std::path::PathBuf::new(),
             transition_type: TransitionType::Smooth,
             transition_duration: 0.5,
-            profiling: false,
         }
     }
 }
@@ -304,7 +302,6 @@ Commands:
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
   --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
-  --profile                    Print per-frame timing breakdown every second
   --help                       Show this help
 
 Transition types:
@@ -355,9 +352,6 @@ pub fn parse_args(args: &[String]) -> Option<AppConfig> {
             "--transition-duration" => {
                 i += 1;
                 config.transition_duration = args.get(i)?.parse().ok()?;
-            }
-                "--profile" => {
-                config.profiling = true;
             }
             _ => {
                 eprintln!("Unknown option: {}", args[i]);
@@ -548,8 +542,6 @@ pub struct App {
     pub last_frame: Instant,
     pub transition_direction: (f32, f32),
     pub transition_blended: bool,
-    frame_count: u64,
-    last_fps_print: Instant,
     previous_frame: Option<Box<dyn GpuFuture>>,
 }
 
@@ -1332,8 +1324,6 @@ pub fn create_app(
         is_transitioning: false,
         transition_blended: false,
         transition_direction: (0.0, 0.0),
-        frame_count: 0,
-        last_fps_print: Instant::now(),
         config,
         last_frame: Instant::now(),
         previous_frame: None,
@@ -1492,7 +1482,7 @@ impl App {
         self.last_frame = now;
 
         if !self.is_transitioning {
-            if self.config.profiling || self.config.transition_type == TransitionType::Smooth {
+            if self.config.transition_type == TransitionType::Smooth {
                 self.request_redraw();
             }
             return;
@@ -1513,12 +1503,10 @@ impl App {
     pub fn render(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         drop(self.previous_frame.take());
 
-        let _t0 = Instant::now();
         let res = &mut self.resources;
 
         let (image_index, _is_suboptimal, acquire_future) =
             vulkano::swapchain::acquire_next_image(res.swapchain.clone(), None)?;
-        let _t1 = Instant::now();
 
         let t = self.transition_time;
         let new_alpha = if self.is_transitioning && self.config.transition_type != TransitionType::Smooth {
@@ -1684,7 +1672,6 @@ impl App {
         }
 
         let command_buffer = builder.build()?;
-        let _t2 = Instant::now();
 
         let future: Box<dyn GpuFuture> = Box::new(
             acquire_future
@@ -1698,29 +1685,8 @@ impl App {
                 )
                 .then_signal_fence_and_flush()?,
         );
-        let _t3 = Instant::now();
 
         self.previous_frame = Some(future);
-        let _t4 = Instant::now();
-
-        if self.config.profiling {
-            self.frame_count += 1;
-            let now = Instant::now();
-            let since_last_log = now.duration_since(self.last_fps_print);
-            if since_last_log.as_secs_f32() >= 1.0 {
-                println!(
-                    "FPS: {:.1} | acquire: {:.3}ms | build_cb: {:.3}ms | submit: {:.3}ms | store_prev: {:.3}ms | total: {:.3}ms",
-                    self.frame_count as f32 / since_last_log.as_secs_f32().max(0.001),
-                    (_t1 - _t0).as_secs_f32() * 1000.0,
-                    (_t2 - _t1).as_secs_f32() * 1000.0,
-                    (_t3 - _t2).as_secs_f32() * 1000.0,
-                    (_t4 - _t3).as_secs_f32() * 1000.0,
-                    (_t4 - _t0).as_secs_f32() * 1000.0,
-                );
-                self.frame_count = 0;
-                self.last_fps_print = now;
-            }
-        }
 
         Ok(())
     }
