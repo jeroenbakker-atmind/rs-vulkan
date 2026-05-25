@@ -87,10 +87,9 @@ Each use case is mapped to the automated tests that cover its success path and e
 | `parse_args_transition_type_default` | `uc_5_smooth_transitions.rs` | Precondition: smooth is the default type |
 | `instant_transition_default_config` | `uc_5_smooth_transitions.rs` | Default config is Smooth |
 | `parse_args_custom_values` | `uc_4_slide_transitions.rs` | Precondition: `--transition-duration` is accepted |
-| `transition_params_t0` | `uc_5_smooth_transitions.rs` | Step 2: at t=0, blend starts at 0, blur is active |
-| `transition_params_t0_25` | `uc_5_smooth_transitions.rs` | Step 4: blend factor between 0 and 1 mid-transition |
-| `transition_params_t0_5` | `uc_5_smooth_transitions.rs` | Step 5: at t=dur, blend reaches 1 |
-| `transition_params_t10` | `uc_5_smooth_transitions.rs` | Steps 5-6: after transition, blend is complete, blur stops |
-| `transition_smoothstep_shape` | `uc_5_smooth_transitions.rs` | Step 2: smoothstep has the correct S-curve shape |
+| `transition_params_t0` | `uc_5_smooth_transitions.rs` | Step 2: at t=0, slide is fully opaque, blur is active |
+| `transition_params_t0_25` | `uc_5_smooth_transitions.rs` | Step 4: blur is progressing mid-transition |
+| `transition_params_t0_5` | `uc_5_smooth_transitions.rs` | Step 5: at t=dur, blur reaches steady state |
+| `transition_params_t10` | `uc_5_smooth_transitions.rs` | Steps 5-6: after transition, blur stops |
 | `parse_args_zero_transition_duration` | `uc_5_smooth_transitions.rs` | Zero `--transition-duration` is accepted |
 | `parse_args_missing_value_after_flag` | `uc_5_smooth_transitions.rs` | Flag without value is rejected |

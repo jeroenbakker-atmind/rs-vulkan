@@ -6,7 +6,7 @@ Sea-level — describes the technical architecture of the rendering pipeline and
 
 ## Overview
 
-The presentation pipeline renders a fullscreen slideshow using the Vulkan API. All graphical work targets a swapchain that is presented to a window. There are two rendering paths: a direct path for static display, instant transitions, and slide transitions; and a four-pass path for smooth transitions.
+The presentation pipeline renders a fullscreen slideshow using the Vulkan API. All graphical work targets a swapchain that is presented to a window. There are two rendering paths: a direct path for static display, instant transitions, and slide transitions; and a three-pass path for smooth transitions.
 
 ## GPU Images
 
@@ -20,13 +20,12 @@ A single combined image sampler descriptor set exposes the slide array to all re
 
 A vertex-less vertex shader generates a fullscreen triangle from the vertex index, covering the entire clip space. The output UV coordinates range from (0,0) at the top-left to (1,1) at the bottom-right.
 
-Four fragment shaders and two compute shaders implement the different rendering modes:
+Two fragment shaders and two compute shaders implement the different rendering modes:
 - A direct fragment shader samples the slide array and outputs the result in a single pass. It handles both static display and slide-in animation.
-- A blend fragment shader samples the current slide and outputs it with a variable alpha for compositing onto the feedback buffer.
-- A present fragment shader mixes the blurred feedback texture with the current slide.
+- A present fragment shader composites the current slide over the blurred feedback using alpha-over compositing, then outputs the result to the swapchain.
 - Two compute shaders implement a separable Gaussian blur across the horizontal and vertical axes.
 
-All shaders receive their parameters through a single 24-byte push constant block containing the current and previous slide layer indices, the blend factor, the blur radius, and the slide offset vector.
+All shaders receive their parameters through a single 24-byte push constant block containing the current and previous slide layer indices, a master opacity, the blur radius, and the slide offset vector.
 
 ## Frame Lifecycle
 

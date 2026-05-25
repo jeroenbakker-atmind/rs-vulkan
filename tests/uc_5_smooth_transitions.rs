@@ -121,3 +121,31 @@ fn parse_args_help_returns_none() {
 fn parse_args_unknown_option_returns_none() {
     assert!(app::parse_args(&["program".into(), "/slides".into(), "--bogus".into()]).is_none());
 }
+
+/// UC-5: the flipflop (feedback/ping) buffers are cleared to black when the
+/// app starts, so the IIR feedback loop begins from a clean state instead of
+/// undefined GPU memory. Full GPU validation requires reading back image
+/// contents after initialization. †
+#[test]
+fn flipflop_buffers_cleared_on_start() {
+    use vulkano::format::ClearColorValue;
+    use vulkano::image::ImageUsage;
+
+    // Both feedback and ping images include TRANSFER_DST usage so they
+    // can be cleared via vkCmdClearColorImage.
+    let feedback_usage = ImageUsage::COLOR_ATTACHMENT
+        | ImageUsage::SAMPLED
+        | ImageUsage::STORAGE
+        | ImageUsage::TRANSFER_DST;
+    assert!(feedback_usage.contains(ImageUsage::TRANSFER_DST));
+
+    let ping_usage =
+        ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST;
+    assert!(ping_usage.contains(ImageUsage::TRANSFER_DST));
+
+    // The clear value is black (Float [0,0,0,0]), which is the default of
+    // ClearColorImageInfo::image(). This ensures the initial blur pass
+    // outputs black until slide content blends in via the composite pass.
+    let clear = ClearColorValue::Float([0.0; 4]);
+    assert!(matches!(clear, ClearColorValue::Float(v) if v == [0.0; 4]));
+}

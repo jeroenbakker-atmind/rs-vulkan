@@ -7,7 +7,7 @@ use smallvec::smallvec;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferUsage, PrimaryCommandBufferAbstract,
+    AutoCommandBufferBuilder, CommandBufferUsage, ClearColorImageInfo, PrimaryCommandBufferAbstract,
     RenderingAttachmentInfo, RenderingInfo,
 };
 use vulkano::command_buffer::CopyBufferToImageInfo;
@@ -25,7 +25,7 @@ use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{Image, ImageCreateInfo, ImageType, ImageUsage, ImageSubresourceRange, ImageAspects, ImageLayout};
 use vulkano::instance::{Instance, InstanceCreateInfo, InstanceExtensions};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator};
-use vulkano::pipeline::graphics::color_blend::{AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState, ColorComponents};
+use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::input_assembly::{InputAssemblyState, PrimitiveTopology};
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, RasterizationState};
@@ -62,33 +62,6 @@ void main() {
     );
     v_uv = pos * 0.5 + 0.5;
     gl_Position = vec4(pos, 0.0, 1.0);
-}
-",
-    }
-}
-
-mod fs_blend {
-    vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r"
-#version 460
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 f_color;
-
-layout(push_constant) uniform PC {
-    int   current_layer;
-    int   previous_layer;
-    float new_alpha;
-    float blur_radius;
-    float slide_offset_x;
-    float slide_offset_y;
-} pc;
-
-layout(set = 0, binding = 0) uniform sampler2DArray slides;
-
-void main() {
-    vec4 slide = texture(slides, vec3(v_uv, pc.current_layer));
-    f_color = vec4(slide.rgb * slide.a * pc.new_alpha, pc.new_alpha);
 }
 ",
     }
@@ -191,11 +164,23 @@ mod fs_present {
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 f_color;
 
+layout(push_constant) uniform PC {
+    int   current_layer;
+    int   previous_layer;
+    float new_alpha;
+    float blur_radius;
+    float slide_offset_x;
+    float slide_offset_y;
+} pc;
+
 layout(set = 0, binding = 0) uniform sampler2D feedback;
+layout(set = 1, binding = 0) uniform sampler2DArray slides;
 
 void main() {
     vec3 fb = texture(feedback, v_uv).rgb;
-    f_color = vec4(fb, 1.0);
+    vec4 slide = texture(slides, vec3(v_uv, pc.current_layer));
+    vec3 result = mix(fb, slide.rgb, slide.a);
+    f_color = vec4(result, 1.0);
 }
 ",
     }
@@ -484,16 +469,14 @@ pub struct GpuResources {
     pub direct_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
     pub direct_pipeline_layout: Arc<PipelineLayout>,
 
-    // Smooth transition feedback pipelines
-    pub blend_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
-    pub blend_pipeline_layout: Arc<PipelineLayout>,
+    // Smooth transition pipelines
     pub blur_h_pipeline: Arc<ComputePipeline>,
     pub blur_v_pipeline: Arc<ComputePipeline>,
     pub blur_pipeline_layout: Arc<PipelineLayout>,
     pub present_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
     pub present_pipeline_layout: Arc<PipelineLayout>,
 
-    // Slides sampler descriptor set (shared by direct and blend pipelines)
+    // Slides sampler descriptor set (shared by direct and present pipelines)
     pub slides_descriptor_set: Arc<DescriptorSet>,
 
     // Feedback texture (single buffer, blurred in-place via ping)
@@ -698,7 +681,10 @@ fn create_feedback_image(
             extent: [extent[0], extent[1], 1],
             array_layers: 1,
             mip_levels: 1,
-            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            usage: ImageUsage::COLOR_ATTACHMENT
+                | ImageUsage::SAMPLED
+                | ImageUsage::STORAGE
+                | ImageUsage::TRANSFER_DST,
             ..Default::default()
         },
         AllocationCreateInfo::default(),
@@ -862,7 +848,7 @@ pub fn create_app(
             extent: [scene_extent[0], scene_extent[1], 1],
             array_layers: 1,
             mip_levels: 1,
-            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
             ..Default::default()
         },
         AllocationCreateInfo::default(),
@@ -880,6 +866,32 @@ pub fn create_app(
             ..Default::default()
         },
     )?;
+
+    // Clear feedback and ping buffers so the IIR feedback loop starts
+    // from black instead of undefined GPU memory.
+    {
+        let mut clear_builder = AutoCommandBufferBuilder::primary(
+            cmd_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .map_err(|e| format!("clear cmd builder: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(feedback_img.clone()))
+            .map_err(|e| format!("clear feedback: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(ping_image.clone()))
+            .map_err(|e| format!("clear ping: {e}"))?;
+        clear_builder
+            .build()
+            .map_err(|e| format!("build clear cb: {e}"))?
+            .execute(queue.clone())
+            .map_err(|e| format!("execute clear: {e}"))?
+            .then_signal_fence_and_flush()
+            .map_err(|e| format!("flush clear: {e}"))?
+            .wait(None)
+            .map_err(|e| format!("wait clear: {e}"))?;
+    }
 
     // Shared descriptor set for slides
     let slides_descriptor_set_layout = DescriptorSetLayout::new(
@@ -928,24 +940,8 @@ pub fn create_app(
         },
     )?;
 
-    // Blend pipeline: renders slide onto feedback with alpha blending
-    let blend_pipeline_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![slides_descriptor_set_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::FRAGMENT,
-                offset: 0,
-                size: 24,
-            }],
-            ..Default::default()
-        },
-    )?;
-
     let vs_module = vs::load(device.clone())
         .map_err(|e| format!("vs load: {e}"))?;
-    let fs_blend_module = fs_blend::load(device.clone())
-        .map_err(|e| format!("fs_blend load: {e}"))?;
     let cs_blur_module = cs_blur::load(device.clone())
         .map_err(|e| format!("cs_blur load: {e}"))?;
     let cs_blur_v_module = cs_blur_v::load(device.clone())
@@ -958,9 +954,6 @@ pub fn create_app(
     let vs_entry = vs_module
         .entry_point("main")
         .ok_or("Vertex shader entry point 'main' not found")?;
-    let fs_blend_entry = fs_blend_module
-        .entry_point("main")
-        .ok_or("Fs_blend fragment shader entry point 'main' not found")?;
     let cs_blur_entry = cs_blur_module
         .entry_point("main")
         .ok_or("Cs_blur compute shader entry point 'main' not found")?;
@@ -974,59 +967,7 @@ pub fn create_app(
         .entry_point("main")
         .ok_or("Fs_direct fragment shader entry point 'main' not found")?;
 
-    // Blend pipeline (smooth, blends slide onto feedback)
-    let blend_pipeline =
-        vulkano::pipeline::graphics::GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: smallvec![
-                    PipelineShaderStageCreateInfo::new(vs_entry.clone()),
-                    PipelineShaderStageCreateInfo::new(fs_blend_entry),
-                ],
-                vertex_input_state: Some(VertexInputState::default()),
-                input_assembly_state: Some(InputAssemblyState {
-                    topology: PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                }),
-                dynamic_state: [
-                    DynamicState::Viewport,
-                    DynamicState::Scissor,
-                ].into_iter().collect(),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState {
-                    cull_mode: CullMode::None,
-                    ..Default::default()
-                }),
-                multisample_state: Some(MultisampleState::default()),
-                depth_stencil_state: None,
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    1,
-                    ColorBlendAttachmentState {
-                        blend: Some(AttachmentBlend {
-                            src_color_blend_factor: BlendFactor::One,
-                            dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
-                            color_blend_op: BlendOp::Add,
-                            src_alpha_blend_factor: BlendFactor::One,
-                            dst_alpha_blend_factor: BlendFactor::Zero,
-                            alpha_blend_op: BlendOp::Add,
-                        }),
-                        color_write_mask: ColorComponents::all(),
-                        ..Default::default()
-                    },
-                )),
-                subpass: Some(PipelineSubpassType::BeginRendering(
-                    PipelineRenderingCreateInfo {
-                        color_attachment_formats: vec![Some(Format::R16G16B16A16_SFLOAT)],
-                        ..Default::default()
-                    },
-                )),
-                ..GraphicsPipelineCreateInfo::layout(blend_pipeline_layout.clone())
-            },
-        )
-        .map_err(|e| format!("blend_pipeline: {e}"))?;
-
-    // Present pipeline (renders feedback to swapchain)
+    // Present pipeline (composites slide over blurred feedback for swapchain)
     let present_descriptor_set_layout = DescriptorSetLayout::new(
         device.clone(),
         DescriptorSetLayoutCreateInfo {
@@ -1044,7 +985,15 @@ pub fn create_app(
     let present_pipeline_layout = PipelineLayout::new(
         device.clone(),
         PipelineLayoutCreateInfo {
-            set_layouts: vec![present_descriptor_set_layout.clone()],
+            set_layouts: vec![
+                present_descriptor_set_layout.clone(),
+                slides_descriptor_set_layout.clone(),
+            ],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::FRAGMENT,
+                offset: 0,
+                size: 24,
+            }],
             ..Default::default()
         },
     )?;
@@ -1246,8 +1195,6 @@ pub fn create_app(
             swapchain_image_views,
             direct_pipeline,
             direct_pipeline_layout,
-            blend_pipeline,
-            blend_pipeline_layout,
             blur_h_pipeline,
             blur_v_pipeline,
             blur_pipeline_layout,
@@ -1460,7 +1407,7 @@ impl App {
         let _t1 = Instant::now();
 
         let t = self.transition_time;
-        let new_alpha = if self.is_transitioning {
+        let new_alpha = if self.is_transitioning && self.config.transition_type != TransitionType::Smooth {
             let u = (t / self.config.transition_duration).min(1.0);
             u * u * (3.0 - 2.0 * u)
         } else {
@@ -1546,35 +1493,7 @@ impl App {
                 ])?;
             }
 
-            // Memory barrier: blur compute writes finished → blend render pass reads
-            // (vulkano handles this via subpass dependencies / automatic barrier tracking)
-
-            // Pass 3: Blend current slide onto feedback
-            builder
-                .begin_rendering(RenderingInfo {
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op: AttachmentLoadOp::Load,
-                        store_op: AttachmentStoreOp::Store,
-                        clear_value: None,
-                        image_layout: ImageLayout::General,
-                        ..RenderingAttachmentInfo::image_view(res.feedback_view.clone())
-                    })],
-                    ..Default::default()
-                })?
-                .bind_pipeline_graphics(res.blend_pipeline.clone())?
-                .set_viewport(0, smallvec![viewport.clone()])?
-                .set_scissor(0, smallvec![scissor.clone()])?
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    res.blend_pipeline_layout.clone(),
-                    0,
-                    res.slides_descriptor_set.clone(),
-                )?
-                .push_constants(res.blend_pipeline_layout.clone(), 0, pc)?;
-            unsafe { builder.draw(3, 1, 0, 0)?; }
-            builder.end_rendering()?;
-
-            // Pass 4: Present feedback to swapchain
+            // Pass 3: Composite slide over blurred feedback and present to swapchain
             builder
                 .begin_rendering(RenderingInfo {
                     color_attachments: vec![Some(RenderingAttachmentInfo {
@@ -1593,7 +1512,14 @@ impl App {
                     res.present_pipeline_layout.clone(),
                     0,
                     res.present_descriptor_set.clone(),
-                )?;
+                )?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    res.present_pipeline_layout.clone(),
+                    1,
+                    res.slides_descriptor_set.clone(),
+                )?
+                .push_constants(res.present_pipeline_layout.clone(), 0, pc)?;
             unsafe { builder.draw(3, 1, 0, 0)?; }
             builder.end_rendering()?;
         } else {
