@@ -156,6 +156,40 @@ void main() {
     }
 }
 
+mod cs_blend_slide {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform PC {
+    int   current_layer;
+    int   previous_layer;
+    float new_alpha;
+    float blur_radius;
+    float slide_offset_x;
+    float slide_offset_y;
+} pc;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D u_feedback;
+layout(set = 0, binding = 1) uniform sampler2DArray u_slides;
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz = imageSize(u_feedback);
+    if (c.x >= sz.x || c.y >= sz.y) return;
+
+    vec2 uv = (vec2(c) + 0.5) / vec2(sz);
+    vec4 slide = texture(u_slides, vec3(uv, pc.previous_layer));
+    vec4 fb = imageLoad(u_feedback, c);
+    vec4 result = mix(fb, vec4(slide.rgb, 1.0), slide.a);
+    imageStore(u_feedback, c, result);
+}
+",
+    }
+}
+
 mod fs_present {
     vulkano_shaders::shader! {
         ty: "fragment",
@@ -493,6 +527,11 @@ pub struct GpuResources {
     pub blur_h_descriptor_set: Arc<DescriptorSet>, // feedback → ping
     pub blur_v_descriptor_set: Arc<DescriptorSet>, // ping → feedback
 
+    // Blend descriptor set and pipeline (slide → feedback, first frame only)
+    pub blend_pipeline: Arc<ComputePipeline>,
+    pub blend_pipeline_layout: Arc<PipelineLayout>,
+    pub blend_descriptor_set: Arc<DescriptorSet>,
+
     pub _format: Format,
     pub window: Arc<winit::window::Window>,
 }
@@ -508,6 +547,7 @@ pub struct App {
     pub config: AppConfig,
     pub last_frame: Instant,
     pub transition_direction: (f32, f32),
+    pub transition_blended: bool,
     frame_count: u64,
     last_fps_print: Instant,
     previous_frame: Option<Box<dyn GpuFuture>>,
@@ -950,6 +990,8 @@ pub fn create_app(
         .map_err(|e| format!("fs_present load: {e}"))?;
     let fs_direct_module = fs_direct::load(device.clone())
         .map_err(|e| format!("fs_direct load: {e}"))?;
+    let cs_blend_slide_module = cs_blend_slide::load(device.clone())
+        .map_err(|e| format!("cs_blend_slide load: {e}"))?;
 
     let vs_entry = vs_module
         .entry_point("main")
@@ -960,6 +1002,9 @@ pub fn create_app(
     let cs_blur_v_entry = cs_blur_v_module
         .entry_point("main")
         .ok_or("Cs_blur_v compute shader entry point 'main' not found")?;
+    let cs_blend_slide_entry = cs_blend_slide_module
+        .entry_point("main")
+        .ok_or("Cs_blend_slide compute shader entry point 'main' not found")?;
     let fs_present_entry = fs_present_module
         .entry_point("main")
         .ok_or("Fs_present fragment shader entry point 'main' not found")?;
@@ -1179,6 +1224,70 @@ pub fn create_app(
     )
     .map_err(|e| format!("blur_v_pipeline: {e}"))?;
 
+    // Blend pipeline: blends current slide into feedback buffer (first frame only)
+    let blend_descriptor_set_layout = DescriptorSetLayout::new(
+        device.clone(),
+        DescriptorSetLayoutCreateInfo {
+            bindings: std::collections::BTreeMap::from([
+                (0u32, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: vulkano::shader::ShaderStages::COMPUTE,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
+                }),
+                (1u32, DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: vulkano::shader::ShaderStages::COMPUTE,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+                }),
+            ]),
+            ..Default::default()
+        },
+    )?;
+
+    let blend_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![blend_descriptor_set_layout.clone()],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::COMPUTE,
+                offset: 0,
+                size: 24,
+            }],
+            ..Default::default()
+        },
+    )?;
+
+    let blend_descriptor_set = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        blend_descriptor_set_layout.clone(),
+        [
+            WriteDescriptorSet::image_view_with_layout(
+                0,
+                DescriptorImageViewInfo {
+                    image_view: feedback_view.clone(),
+                    image_layout: ImageLayout::General,
+                },
+            ),
+            WriteDescriptorSet::image_view_sampler(
+                1,
+                texture_view.clone(),
+                sampler.clone(),
+            ),
+        ],
+        [],
+    )
+    .map_err(|e| format!("blend descriptor_set: {e}"))?;
+
+    let blend_pipeline = ComputePipeline::new(
+        device.clone(),
+        None,
+        ComputePipelineCreateInfo::stage_layout(
+            PipelineShaderStageCreateInfo::new(cs_blend_slide_entry),
+            blend_pipeline_layout.clone(),
+        ),
+    )
+    .map_err(|e| format!("blend_pipeline: {e}"))?;
+
     if let Some(meta) = collection.meta(0) {
         println!("{}", texture::format_slide_display(meta, 0, collection.len()));
     }
@@ -1209,6 +1318,9 @@ pub fn create_app(
             present_descriptor_set: present_set,
             blur_h_descriptor_set: blur_h_set,
             blur_v_descriptor_set: blur_v_set,
+            blend_pipeline,
+            blend_pipeline_layout,
+            blend_descriptor_set,
             _format: format,
             window,
         },
@@ -1218,6 +1330,7 @@ pub fn create_app(
         previous_layer: 0,
         transition_time: 0.0,
         is_transitioning: false,
+        transition_blended: false,
         transition_direction: (0.0, 0.0),
         frame_count: 0,
         last_fps_print: Instant::now(),
@@ -1321,6 +1434,7 @@ impl App {
             self.transition_direction = (0.0, 0.0);
         }
         self.last_frame = Instant::now();
+        self.transition_blended = false;
 
         if let Some(meta) = self.collection.meta(target) {
             println!(
@@ -1457,6 +1571,27 @@ impl App {
         )?;
 
         if self.config.transition_type == TransitionType::Smooth {
+            // Pass 0: Blend current slide into feedback (first frame only)
+            if self.is_transitioning && !self.transition_blended {
+                builder
+                    .bind_pipeline_compute(res.blend_pipeline.clone())?
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        res.blend_pipeline_layout.clone(),
+                        0,
+                        res.blend_descriptor_set.clone(),
+                    )?
+                    .push_constants(res.blend_pipeline_layout.clone(), 0, pc)?;
+                unsafe {
+                    builder.dispatch([
+                        (extent[0] + 15) / 16,
+                        (extent[1] + 15) / 16,
+                        1,
+                    ])?;
+                }
+                self.transition_blended = true;
+            }
+
             // Pass 1: Horizontal blur (feedback → ping)
             builder
                 .bind_pipeline_compute(res.blur_h_pipeline.clone())?

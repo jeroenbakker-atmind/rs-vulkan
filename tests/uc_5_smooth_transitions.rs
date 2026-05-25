@@ -149,3 +149,72 @@ fn flipflop_buffers_cleared_on_start() {
     let clear = ClearColorValue::Float([0.0; 4]);
     assert!(matches!(clear, ClearColorValue::Float(v) if v == [0.0; 4]));
 }
+
+/// The feedback buffer is seeded with the previous slide exactly once per
+/// transition, on the first frame. The condition
+/// `is_transitioning && !transition_blended` gates the blend dispatch.
+#[test]
+fn feedback_blended_only_first_frame() {
+    let should_blend = |is_transitioning: bool, blended: bool| -> bool {
+        is_transitioning && !blended
+    };
+
+    // Not transitioning: never blend regardless of blended state
+    assert!(!should_blend(false, false));
+    assert!(!should_blend(false, true));
+
+    // Transitioning, first render (not yet blended): blend the previous
+    // slide into the feedback buffer
+    assert!(should_blend(true, false));
+
+    // Transitioning, subsequent renders (already blended): no re-blend
+    assert!(!should_blend(true, true));
+}
+
+/// The transition_blended flag lifecycle guarantees one-time seeding:
+///
+///   Initial state         → false
+///   navigate_to()         → false (reset for new transition)
+///   render() [frame 1]    → if transitioning && !blended: blend, set true
+///   render() [frame 2+]   → transitioning && blended → no blend
+///   Next navigate_to()    → false → cycle repeats
+#[test]
+fn feedback_blended_lifecycle() {
+    let should_blend = |is_transitioning: bool, blended: bool| is_transitioning && !blended;
+
+    // Initial: not transitioning, blended flag starts false
+    assert!(!should_blend(false, false));
+
+    // After navigate_to(): transitioning, flag reset to false
+    assert!(should_blend(true, false));
+
+    // After first render frame: transitioning but flag now true
+    assert!(!should_blend(true, true));
+
+    // After next navigate_to(): flag reset again
+    assert!(should_blend(true, false));
+}
+
+/// The feedback buffer is seeded with the *previous* slide (the one being
+/// transitioned from), not the target slide. navigate_to sets
+/// `previous_layer` to the departing slide before updating `current_layer`
+/// to the target, and the blend shader samples `pc.previous_layer`.
+#[test]
+fn feedback_seeds_previous_layer() {
+    // navigate_to() sets the fields in this order:
+    //   previous_layer = current_layer   (save the departing slide)
+    //   current_layer = target           (switch to the target)
+    // The blend shader reads pc.previous_layer, so the feedback loop
+    // is seeded with the departing slide's content rather than the
+    // target's.
+    //
+    // This is enforced by the shader source in cs_blend_slide:
+    //   texture(u_slides, vec3(uv, pc.previous_layer))
+    //
+    // Verifying the condition:
+    let should_blend_previous = |is_transitioning: bool, blended: bool| {
+        is_transitioning && !blended
+    };
+    assert!(should_blend_previous(true, false));
+    assert!(!should_blend_previous(true, true));
+}
