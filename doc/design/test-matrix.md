@@ -22,7 +22,6 @@ Each use case is mapped to the automated tests that cover its success path and e
 | `parse_args_no_args_returns_none` | `uc_5_smooth_transitions.rs` | Extension 2a: no path provided |
 | `parse_args_help_returns_none` | `uc_5_smooth_transitions.rs` | `--help` shows help text and exits |
 | `parse_args_unknown_option_returns_none` | `uc_5_smooth_transitions.rs` | Unknown option is rejected |
-| `parse_args_profile` | `uc_5_smooth_transitions.rs` | `--profile` flag sets profiling mode |
 | `load_directory_basic` | `uc_2_show_presentation.rs` | Slides loaded, keys and metadata are correct |
 | `load_directory_sorted` | `uc_2_show_presentation.rs` | Slides sorted by (chapter, slide) |
 | `load_directory_empty_errors` | `uc_2_show_presentation.rs` | Extension 2a: no PNG files |

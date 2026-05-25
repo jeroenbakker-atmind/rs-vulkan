@@ -26,7 +26,6 @@ Navigate with arrow keys and Escape to quit.
 Customize the viewing experience:
 
 - `--transition-duration`: Transition timing for slide mode
-- `--profile`: Print per-frame timing breakdown
 
 Default values work well for most presentations.
 ## 2_2: Deployment

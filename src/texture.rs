@@ -32,10 +32,6 @@ impl SlideCollection {
         self.slides.get(layer).map(|s| s.chapter)
     }
 
-    pub fn slide_num_of(&self, layer: usize) -> Option<u32> {
-        self.slides.get(layer).map(|s| s.slide)
-    }
-
     pub fn meta(&self, layer: usize) -> Option<&SlideMeta> {
         let key = self.slides.get(layer)?;
         self.metadata.get(&(key.chapter, key.slide))

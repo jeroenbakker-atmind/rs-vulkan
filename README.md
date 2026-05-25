@@ -17,7 +17,6 @@ Commands:
 Options:
   --transition-type <type>     Transition style: smooth (default), instant, or slide
   --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
-  --profile                    Print per-frame timing breakdown every second
   --help                       Show this help
 ```
 
@@ -73,10 +72,9 @@ flowchart LR
 ```mermaid
 flowchart LR
     subgraph Frame [Per-frame smooth transition]
-        A["Pass 1: blend current slide onto input_feedback\n(graphics, SrcAlpha blending)"] --> B["Pass 2: horizontal blur\n(compute, feedback → ping)"]
-        B --> C["Pass 3: vertical blur\n(compute, ping → output_feedback)"]
-        C --> D["Pass 4: present output_feedback + slide\n(graphics, to swapchain)"]
-        D --> E["swap(feedback_A, feedback_B)"]
+        A["Pass 0: blend previous slide into feedback\n(compute, only first frame of transition)"] -.-> B["Pass 1: horizontal blur\n(compute, feedback → ping)"]
+        B --> C["Pass 2: vertical blur\n(compute, ping → feedback)"]
+        C --> D["Pass 3: present feedback + slide\n(graphics, to swapchain)"]
     end
 ```
 
@@ -84,12 +82,14 @@ flowchart LR
 
 | Pass | Type | Source → Dest | Shader |
 |------|------|---------------|--------|
-| 1 | Graphics | slides → feedback (LOAD, alpha blend) | `fs_blend` |
-| 2 | Compute | feedback → ping (horizontal Gaussian) | `cs_blur_h` |
-| 3 | Compute | ping → feedback (vertical Gaussian) | `cs_blur_v` |
-| 4 | Graphics | feedback + slides → swapchain (CLEAR) | `fs_present` |
+| 0¹ | Compute | previous slide → feedback (alpha blend) | `cs_blend_slide` |
+| 1 | Compute | feedback → ping (horizontal Gaussian) | `cs_blur_h` |
+| 2 | Compute | ping → feedback (vertical Gaussian) | `cs_blur_v` |
+| 3 | Graphics | feedback + slides → swapchain (CLEAR) | `fs_present` |
 
-The input and output feedback textures are swapped at the end of each frame via `feedback_idx ^= 1`, creating an infinite-impulse-response (IIR) blur that progressively blurs the previous content while the new slide accumulates via alpha blending.
+> ¹ Pass 0 runs only on the first frame of each transition. It seeds the feedback buffer with the departing (previous) slide content so the blur loop begins from a clean state. Subsequent frames skip this pass — the slide never re-enters the feedback loop.
+
+A single feedback texture stores the IIR (infinite-impulse-response) accumulation. The separable blur reads from the feedback buffer, writes to a ping intermediate, then reads from ping and writes back to feedback — no texture swapping is needed.
 
 ### Non-smooth paths
 
@@ -105,32 +105,31 @@ For `instant` and `slide` transition types (and when not transitioning in `smoot
 struct PushConstants {
     current_layer: i32,     // texture array index of current (target) slide
     previous_layer: i32,    // texture array index of previous (source) slide
-    new_alpha: f32,         // cross-fade / blend weight (0→1, smoothstep)
     blur_radius: f32,       // Gaussian blur kernel radius (compute shader)
     slide_offset_x: f32,    // horizontal UV offset for slide transition
     slide_offset_y: f32,    // vertical UV offset for slide transition
 }
-// Total: 24 bytes
+// Total: 20 bytes
 ```
 
 ## Transition types
 
 | Type      | Description                                       | Config parameters            |
 |-----------|---------------------------------------------------|------------------------------|
-| `smooth`  | Compute-shader Gaussian blur + feedback ping-pong | (none)                       |
+| `smooth`  | Compute-shader Gaussian blur with single feedback buffer | (none)                       |
 | `instant` | Immediate cut, no animation                       | (none)                       |
 | `slide`   | Slide new slide in with cubic ease-out            | `transition-duration`        |
 
 ### `smooth`
 
-Uses a two-texture feedback loop. Each frame during the transition:
+Uses a single feedback buffer with a separable Gaussian blur. Each frame during the transition:
 
-1. The target slide is alpha-blended onto the input feedback texture (accumulates)
-2. A separable Gaussian blur runs in a compute shader (horizontal → vertical, via a ping-pong intermediate)
-3. The output feedback is drawn to the swapchain, with the target slide blended on top
-4. The feedback textures are swapped for next frame
+1. (First frame only) The **previous** (departing) slide is alpha-blended into the feedback buffer to seed the IIR loop — `cs_blend_slide` compute shader
+2. Horizontal blur: feedback → ping intermediate — `cs_blur_h` compute shader
+3. Vertical blur: ping → feedback — `cs_blur_v` compute shader
+4. The blurred feedback is drawn to the swapchain with the **target** slide composited on top — `fs_present` fragment shader
 
-The blur radius is constant during the transition. Because the blur is applied every frame, old content progressively blurs out via the IIR feedback loop while the new slide becomes dominant through continuous alpha blending.
+The blur radius is constant during the transition (default 20). Because the blur is applied every frame, the seeded previous-slide content progressively blurs out while the target slide is composited fresh each frame — it never re-enters the feedback loop.
 
 ### `instant`
 

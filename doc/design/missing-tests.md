@@ -17,7 +17,7 @@ Tests requiring an `App` instance or `GpuResources` need a Vulkan device and can
 | Extension 2b † | Dimension mismatch validation inside `create_texture_array` (line 598—607 of `src/app.rs`) has no test. The height/width comparison branch that returns `Err("Image '...' is NxM, expected NxM")` is never exercised. Requires a Vulkan device. |
 | State machine † | The `update()` method (line 1473 of `src/app.rs`) that accumulates delta time and clears `is_transitioning` is not tested. The `last_frame` timestamp reset in `navigate_to` is not independently verified. |
 | Direction override in navigate_to † | For non-Slide transitions, `navigate_to` resets direction to `(0.0, 0.0)` at line 1418. This override is not tested. |
-| `current_layer_idx` edge cases † | Navigating when `current_layer_idx` is at bounds (first slide while already transitioning, last slide while already transitioning). |
+| `current_layer` edge cases † | Navigating when `current_layer` is at bounds (first slide while already transitioning, last slide while already transitioning). |
 
 ## UC-3: Navigate with Instant Transitions
 

@@ -77,7 +77,6 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(push_constant) uniform PC {
     int   current_layer;
     int   previous_layer;
-    float new_alpha;
     float blur_radius;
     float slide_offset_x;
     float slide_offset_y;
@@ -122,7 +121,6 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(push_constant) uniform PC {
     int   current_layer;
     int   previous_layer;
-    float new_alpha;
     float blur_radius;
     float slide_offset_x;
     float slide_offset_y;
@@ -166,7 +164,6 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(push_constant) uniform PC {
     int   current_layer;
     int   previous_layer;
-    float new_alpha;
     float blur_radius;
     float slide_offset_x;
     float slide_offset_y;
@@ -201,7 +198,6 @@ layout(location = 0) out vec4 f_color;
 layout(push_constant) uniform PC {
     int   current_layer;
     int   previous_layer;
-    float new_alpha;
     float blur_radius;
     float slide_offset_x;
     float slide_offset_y;
@@ -231,7 +227,6 @@ layout(location = 0) out vec4 f_color;
 layout(push_constant) uniform PC {
     int   current_layer;
     int   previous_layer;
-    float new_alpha;
     float blur_radius;
     float slide_offset_x;
     float slide_offset_y;
@@ -305,7 +300,7 @@ Options:
   --help                       Show this help
 
 Transition types:
-  smooth  - Compute-shader blur with feedback ping-pong (default)
+  smooth  - Compute-shader blur with single feedback buffer (default)
   instant - No animation, immediate cut
   slide   - New slide slides in; from bottom for slides, from right for chapters"
     );
@@ -484,13 +479,11 @@ pub fn init_example_presentation(path: &std::path::Path) {
 
 #[allow(dead_code)]
 pub struct GpuResources {
-    pub _device: Arc<Device>,
     pub queue: Arc<vulkano::device::Queue>,
-    pub _memory_allocator: Arc<StandardMemoryAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub swapchain: Arc<Swapchain>,
-    pub _swapchain_images: Vec<Arc<Image>>,
+    pub swapchain_images: Vec<Arc<Image>>,
     pub swapchain_image_views: Vec<Arc<ImageView>>,
 
     // Direct rendering pipeline (for Instant/Slide and non-transitioning)
@@ -526,7 +519,6 @@ pub struct GpuResources {
     pub blend_pipeline_layout: Arc<PipelineLayout>,
     pub blend_descriptor_set: Arc<DescriptorSet>,
 
-    pub _format: Format,
     pub window: Arc<winit::window::Window>,
 }
 
@@ -856,7 +848,7 @@ pub fn create_app(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("swapchain image views: {e}"))?;
 
-    let (_texture_image, texture_view, sampler) = create_texture_array(
+    let (_, texture_view, sampler) = create_texture_array(
         device.clone(),
         memory_allocator.clone(),
         queue.clone(),
@@ -966,7 +958,7 @@ pub fn create_app(
             push_constant_ranges: vec![PushConstantRange {
                 stages: vulkano::shader::ShaderStages::FRAGMENT,
                 offset: 0,
-                size: 24,
+                size: 20,
             }],
             ..Default::default()
         },
@@ -1029,7 +1021,7 @@ pub fn create_app(
             push_constant_ranges: vec![PushConstantRange {
                 stages: vulkano::shader::ShaderStages::FRAGMENT,
                 offset: 0,
-                size: 24,
+                size: 20,
             }],
             ..Default::default()
         },
@@ -1161,7 +1153,7 @@ pub fn create_app(
             push_constant_ranges: vec![PushConstantRange {
                 stages: vulkano::shader::ShaderStages::COMPUTE,
                 offset: 0,
-                size: 24,
+                size: 20,
             }],
             ..Default::default()
         },
@@ -1243,7 +1235,7 @@ pub fn create_app(
             push_constant_ranges: vec![PushConstantRange {
                 stages: vulkano::shader::ShaderStages::COMPUTE,
                 offset: 0,
-                size: 24,
+                size: 20,
             }],
             ..Default::default()
         },
@@ -1286,13 +1278,11 @@ pub fn create_app(
 
     Ok(App {
         resources: GpuResources {
-            _device: device,
             queue,
-            _memory_allocator: memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator: cmd_allocator,
             swapchain,
-            _swapchain_images: swapchain_images,
+            swapchain_images,
             swapchain_image_views,
             direct_pipeline,
             direct_pipeline_layout,
@@ -1313,7 +1303,6 @@ pub fn create_app(
             blend_pipeline,
             blend_pipeline_layout,
             blend_descriptor_set,
-            _format: format,
             window,
         },
         collection,
@@ -1392,7 +1381,6 @@ fn create_swapchain(
 struct PushConstants {
     current_layer: i32,
     previous_layer: i32,
-    new_alpha: f32,
     blur_radius: f32,
     slide_offset_x: f32,
     slide_offset_y: f32,
@@ -1505,16 +1493,9 @@ impl App {
 
         let res = &mut self.resources;
 
-        let (image_index, _is_suboptimal, acquire_future) =
+        let (image_index, _, acquire_future) =
             vulkano::swapchain::acquire_next_image(res.swapchain.clone(), None)?;
 
-        let t = self.transition_time;
-        let new_alpha = if self.is_transitioning && self.config.transition_type != TransitionType::Smooth {
-            let u = (t / self.config.transition_duration).min(1.0);
-            u * u * (3.0 - 2.0 * u)
-        } else {
-            1.0
-        };
         let blur_radius = if self.config.transition_type == TransitionType::Smooth {
             20.0
         } else {
@@ -1522,7 +1503,7 @@ impl App {
         };
 
         let (slide_offset_x, slide_offset_y) = if self.is_transitioning && self.config.transition_type == TransitionType::Slide {
-            let u = (t / self.config.transition_duration).min(1.0);
+            let u = (self.transition_time / self.config.transition_duration).min(1.0);
             let ease_out = 1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u);
             (
                 self.transition_direction.0 * (1.0 - ease_out),
@@ -1535,13 +1516,12 @@ impl App {
         let pc = PushConstants {
             current_layer: self.current_layer as i32,
             previous_layer: self.previous_layer as i32,
-            new_alpha,
             blur_radius,
             slide_offset_x,
             slide_offset_y,
         };
 
-        let extent = res._swapchain_images[image_index as usize].extent();
+        let extent = res.swapchain_images[image_index as usize].extent();
         let viewport = Viewport {
             offset: [0.0, 0.0],
             extent: [extent[0] as f32, extent[1] as f32],

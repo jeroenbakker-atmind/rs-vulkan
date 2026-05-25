@@ -6,13 +6,13 @@ Sea-level — describes the technical architecture of the rendering pipeline and
 
 ## Overview
 
-The presentation pipeline renders a fullscreen slideshow using the Vulkan API. All graphical work targets a swapchain that is presented to a window. There are two rendering paths: a direct path for static display, instant transitions, and slide transitions; and a three-pass path for smooth transitions.
+The presentation pipeline renders a fullscreen slideshow using the Vulkan API. All graphical work targets a swapchain that is presented to a window. There are two rendering paths: a direct path for static display, instant transitions, and slide transitions; and a multi-pass path for smooth transitions (three passes per frame, with an optional first-frame blend pass).
 
 ## GPU Images
 
 All slides are uploaded into a single GPU texture array of format `R16G16B16A16_SFLOAT` with one array layer per slide. A nearest-level sampler with clamp-to-edge addressing samples from this array using the desired layer index.
 
-Two feedback images of the same floating-point format and at swapchain dimensions serve as persistent accumulation buffers for the smooth transition effect. These are created with color attachment, sampled, and storage usage flags because they are alternately used as render targets, compute shader inputs/outputs, and sampled textures. A single ping image of the same format and dimensions acts as an intermediate buffer for the separable blur.
+One feedback image of the same floating-point format and at swapchain dimensions serves as a persistent accumulation buffer for the smooth transition effect. It is created with color attachment, sampled, and storage usage flags because it is used as a compute shader input/output and a sampled texture. A single ping image of the same format and dimensions acts as an intermediate buffer for the separable blur.
 
 A single combined image sampler descriptor set exposes the slide array to all rendering pipelines. The feedback and blur pipelines each have their own descriptor sets.
 
@@ -20,12 +20,13 @@ A single combined image sampler descriptor set exposes the slide array to all re
 
 A vertex-less vertex shader generates a fullscreen triangle from the vertex index, covering the entire clip space. The output UV coordinates range from (0,0) at the top-left to (1,1) at the bottom-right.
 
-Two fragment shaders and two compute shaders implement the different rendering modes:
+One fragment shader and three compute shaders implement the different rendering modes:
 - A direct fragment shader samples the slide array and outputs the result in a single pass. It handles both static display and slide-in animation.
 - A present fragment shader composites the current slide over the blurred feedback using alpha-over compositing, then outputs the result to the swapchain.
-- Two compute shaders implement a separable Gaussian blur across the horizontal and vertical axes.
+- A blend compute shader seeds the feedback buffer with the previous (departing) slide on the first frame of a transition only.
+- Two blur compute shaders implement a separable Gaussian blur across the horizontal and vertical axes.
 
-All shaders receive their parameters through a single 24-byte push constant block containing the current and previous slide layer indices, a master opacity, the blur radius, and the slide offset vector.
+All shaders receive their parameters through a single 20-byte push constant block containing the current and previous slide layer indices, the blur radius, and the slide offset vector.
 
 ## Frame Lifecycle
 
