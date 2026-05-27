@@ -6,8 +6,10 @@ use std::path::Path;
 use rs_vulkan::texture::{parse_presenter_notes, SlideCollection, SlideKey, SlideMeta};
 
 /// Create a solid-color RGBA PNG at the given path and dimensions.
+/// Black is fully transparent; any other color is fully opaque.
 pub fn create_test_image(path: &Path, width: u32, height: u32, r: u8, g: u8, b: u8) {
-    let img = image::RgbaImage::from_fn(width, height, |_, _| image::Rgba([r, g, b, 255]));
+    let a = if r == 0 && g == 0 && b == 0 { 0 } else { 255 };
+    let img = image::RgbaImage::from_fn(width, height, |_, _| image::Rgba([r, g, b, a]));
     img.save(path).unwrap();
 }
 

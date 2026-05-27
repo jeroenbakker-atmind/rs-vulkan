@@ -25,7 +25,7 @@ Navigate with arrow keys and Escape to quit.
 ## 2_1: Configuration
 Customize the viewing experience:
 
-- `--transition-duration`: Transition timing for slide mode
+- `--transition-duration`: Transition timing
 
 Default values work well for most presentations.
 ## 2_2: Deployment
@@ -40,7 +40,7 @@ Tips for presentations:
 RS-Vulkan features:
 
 - Hardware-accelerated rendering via Vulkan
-- Smooth transitions with blur and fade effects
+- Smooth transitions with compute-shader blur and feedback
 - Presenter notes support
 - Chapter-based navigation
 - Fullscreen presentation mode

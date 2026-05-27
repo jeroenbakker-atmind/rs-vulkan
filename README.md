@@ -15,9 +15,16 @@ Commands:
   init <path>        Create an example presentation at <path>
 
 Options:
-  --transition-type <type>     Transition style: smooth (default), instant, or slide
+  --transition-type <type>     Transition style: smooth (default), instant, slide, or fluid
   --transition-duration <sec>  Transition duration in seconds (slide; default: 0.5)
   --help                       Show this help
+
+Transition types:
+  fluid   - Stable fluids advection for each color channel (default)
+  smooth  - Compute-shader blur with single feedback buffer
+  instant - No animation, immediate cut
+  slide   - New slide slides in; from bottom for slides, from right for chapters
+  fluid   - Stable fluids advection for each color channel
 ```
 
 ### Slide naming
@@ -30,7 +37,7 @@ Slides are PNG files named `{chapter}_{slide}.png` (e.g. `1_1.png`, `2_3.png`). 
 # Create a new presentation
 rs-vulkan init my-talk
 
-# Default smooth transition (compute blur + feedback)
+# Default fluid transition (stable fluids advection)
 rs-vulkan my-talk
 
 # Slide transition, 3 second duration
@@ -38,6 +45,9 @@ rs-vulkan my-talk --transition-type slide --transition-duration 3
 
 # Instant cuts (no animation)
 rs-vulkan my-talk --transition-type instant
+
+# Stable fluids transition (advects previous slide in background)
+rs-vulkan my-talk --transition-type fluid
 
 # Combine slide transition with custom timing
 rs-vulkan my-talk --transition-type slide --transition-duration 2
@@ -119,6 +129,7 @@ struct PushConstants {
 | `smooth`  | Compute-shader Gaussian blur with single feedback buffer | (none)                       |
 | `instant` | Immediate cut, no animation                       | (none)                       |
 | `slide`   | Slide new slide in with cubic ease-out            | `transition-duration`        |
+| `fluid`   | Stable fluids advection of previous slide content in background | (none)                       |
 
 ### `smooth`
 
@@ -147,3 +158,48 @@ The incoming slide slides into view with a cubic ease-out curve (`f(t) = 1 - (1-
 | `prev_chapter` | Slides in from **left** (rightward) |
 
 Duration is controlled by `--transition-duration` (default 0.5s).
+
+### `fluid`
+
+A stable fluids simulation runs continuously in the background. On the first
+frame of each transition, the **previous** (departing) slide is seeded into
+the density field. Each subsequent frame:
+
+1. **Buoyancy**: a velocity-driving force is computed from the density
+   gradient and added to the 2D velocity field, with per-frame damping to
+   prevent unbounded growth.
+2. **Self-advection**: the velocity field advects itself via a semi-Lagrangian
+   scheme using Catmull-Rom bicubic interpolation (reduces numerical diffusion
+   compared to bilinear).
+3. **Helmholtz-Hodge projection**: divergence → 10 Jacobi Poisson iterations → gradient
+   subtraction, keeping the velocity divergence-free.
+4. **Density advection**: the density field (feedback buffer) is advected by the
+   velocity field (two substeps for CFL stability).
+5. **Composite**: the current slide is composited over the advected density with
+   alpha blending — colored pixels in the current slide replace the fluid
+   underneath, while transparent background lets the swirling previous-slide
+   content show through.
+
+| Pass | Type | Source → Dest | Shader |
+|------|------|---------------|--------|
+| 0¹ | Compute | previous slide → feedback (alpha blend) | `cs_blend_slide` |
+| 1 | Compute | feedback gradient → velocity | `cs_fluid_add_buoyancy` |
+| 2 | Compute | velocity → velocity_ping (self-advection) | `cs_fluid_advect` |
+| 3 | Compute | velocity_ping → divergence | `cs_fluid_divergence` |
+| 4 | Compute | divergence + pressure ↔ pressure_ping (×10 Jacobi) | `cs_fluid_jacobi` |
+| 5 | Compute | pressure + velocity_ping → velocity (project) | `cs_fluid_gradient_subtract` |
+| 6a | Compute | feedback → ping (density advection) | `cs_fluid_advect` |
+| 6b | Compute | ping → feedback (density advection) | `cs_fluid_advect` |
+| 7 | Graphics | feedback + slides → swapchain (CLEAR) | `fs_present` |
+
+> ¹ Pass 0 runs only on the first frame of each transition. It seeds the
+> density field with the departing slide content. After the transition duration
+> elapses the velocity continues to evolve, keeping the fluid alive
+> indefinitely.
+
+### Slide alpha convention
+
+Generated slides (`init`) use a transparent black background with fully opaque
+colored rectangles. In the fluid transition, the transparent background allows
+the advected previous-slide content to bleed through, while opaque regions of
+the current slide fully cover it.

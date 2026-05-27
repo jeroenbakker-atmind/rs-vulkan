@@ -14,21 +14,19 @@ fn parse_args_transition_type_smooth_explicit() {
     assert_eq!(config.unwrap().transition_type, TransitionType::Smooth);
 }
 
-/// UC-5 precondition: smooth is the default transition type when no
-/// `--transition-type` flag is given.
+/// The default transition type is Fluid when no `--transition-type` is given.
 #[test]
-fn parse_args_transition_type_default() {
+fn parse_args_default_fluid() {
     let config = app::parse_args(&["program".into(), "/slides".into()]);
     assert!(config.is_some());
-    assert_eq!(config.unwrap().transition_type, TransitionType::Smooth);
+    assert_eq!(config.unwrap().transition_type, TransitionType::Fluid);
 }
 
-/// UC-5 precondition: the default AppConfig has transition_type set to
-/// Smooth.
+/// The default AppConfig has transition_type set to Fluid.
 #[test]
-fn instant_transition_default_config() {
+fn default_config_fluid() {
     let config = AppConfig::default();
-    assert_eq!(config.transition_type, TransitionType::Smooth);
+    assert_eq!(config.transition_type, TransitionType::Fluid);
 }
 
 /// UC-5 step 2: at t=0 the blend factor starts at 0 and the blur is active.

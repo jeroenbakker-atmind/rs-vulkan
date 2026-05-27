@@ -1,5 +1,6 @@
 mod app;
 mod texture;
+mod transitions;
 
 use winit::event::WindowEvent;
 use winit::event_loop::EventLoop;

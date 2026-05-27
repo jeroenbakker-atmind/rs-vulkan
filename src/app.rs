@@ -38,7 +38,6 @@ use vulkano::pipeline::layout::{PipelineLayout, PipelineLayoutCreateInfo, PushCo
 use vulkano::pipeline::DynamicState;
 use vulkano::pipeline::PipelineBindPoint;
 use vulkano::pipeline::PipelineShaderStageCreateInfo;
-use vulkano::pipeline::compute::{ComputePipeline, ComputePipelineCreateInfo};
 use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 use vulkano::format::{ClearValue, Format};
 use vulkano::swapchain::{
@@ -48,6 +47,7 @@ use vulkano::sync::GpuFuture;
 use vulkano::{VulkanLibrary};
 
 use crate::texture;
+use crate::transitions;
 
 mod vs {
     vulkano_shaders::shader! {
@@ -67,376 +67,7 @@ void main() {
     }
 }
 
-mod cs_blur {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(push_constant) uniform PC {
-    int   current_layer;
-    int   previous_layer;
-    float blur_radius;
-    float slide_offset_x;
-    float slide_offset_y;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
-layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
-
-shared vec4 cache[16][16];
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(src);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    int r = int(max(1.0, pc.blur_radius));
-    float sigma = float(r) * 0.333;
-    vec4 accum = vec4(0.0);
-    float total = 0.0;
-
-    // direction of blur is the X-axis (set in the shader specialization via swapping)
-    for (int x = -r; x <= r; x++) {
-        ivec2 p = ivec2(clamp(c.x + x, 0, sz.x - 1), c.y);
-        float w = exp(-float(x * x) / (2.0 * sigma * sigma));
-        accum += imageLoad(src, p) * w;
-        total += w;
-    }
-
-    imageStore(dst, c, accum / total);
-}
-",
-    }
-}
-
-mod cs_blur_v {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   current_layer;
-    int   previous_layer;
-    float blur_radius;
-    float slide_offset_x;
-    float slide_offset_y;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D src;
-layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D dst;
-
-shared vec4 cache[16][16];
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(src);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    int r = int(max(1.0, pc.blur_radius));
-    float sigma = float(r) * 0.333;
-    vec4 accum = vec4(0.0);
-    float total = 0.0;
-
-    for (int y = -r; y <= r; y++) {
-        ivec2 p = ivec2(c.x, clamp(c.y + y, 0, sz.y - 1));
-        float w = exp(-float(y * y) / (2.0 * sigma * sigma));
-        accum += imageLoad(src, p) * w;
-        total += w;
-    }
-
-    imageStore(dst, c, accum / total);
-}
-",
-    }
-}
-
-mod cs_blend_slide {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   current_layer;
-    int   previous_layer;
-    float blur_radius;
-    float slide_offset_x;
-    float slide_offset_y;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform image2D u_feedback;
-layout(set = 0, binding = 1) uniform sampler2DArray u_slides;
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(u_feedback);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    vec2 uv = (vec2(c) + 0.5) / vec2(sz);
-    vec4 slide = texture(u_slides, vec3(uv, pc.previous_layer));
-    vec4 fb = imageLoad(u_feedback, c);
-    vec4 result = mix(fb, vec4(slide.rgb, 1.0), slide.a);
-    imageStore(u_feedback, c, result);
-}
-",
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Stable Fluids Simulation shaders
-// ---------------------------------------------------------------------------
-
-// Semi-Lagrangian advection: reads a field at position x - velocity*dt
-// Uses 3 storage images: src (readonly), velocity field (readonly), dst (writeonly)
-mod cs_fluid_advect {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   unused0;
-    int   unused1;
-    float dt;
-    float dx;
-    float dy;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_src;
-layout(set = 0, binding = 1, rgba16f) uniform readonly image2D u_vel;
-layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_dst;
-
-float catrom_weight(float d) {
-    d = abs(d);
-    if (d < 1.0) {
-        return 1.5 * d * d * d - 2.5 * d * d + 1.0;
-    } else if (d < 2.0) {
-        return -0.5 * d * d * d + 2.5 * d * d - 4.0 * d + 2.0;
-    } else {
-        return 0.0;
-    }
-}
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(u_src);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    vec2 uv = (vec2(c) + 0.5) / vec2(sz);
-    vec2 vel = imageLoad(u_vel, c).rg;
-    vec2 src_uv = uv - vel * pc.dt;
-    src_uv = clamp(src_uv, vec2(0.0), vec2(1.0));
-
-    // Catmull-Rom bicubic interpolation (preserves high frequencies
-    // much better than bilinear, reducing numerical diffusion)
-    vec2 f = src_uv * vec2(sz) - 0.5;
-    ivec2 ic = ivec2(floor(f));
-    vec2 fr = f - vec2(ic);
-
-    vec4 result = vec4(0.0);
-    for (int dy = -1; dy <= 2; dy++) {
-        for (int dx = -1; dx <= 2; dx++) {
-            ivec2 p = clamp(ic + ivec2(dx, dy), ivec2(0), sz - 1);
-            float ddx = float(dx) - fr.x;
-            float ddy = float(dy) - fr.y;
-            float wx = catrom_weight(ddx);
-            float wy = catrom_weight(ddy);
-            result += imageLoad(u_src, p) * wx * wy;
-        }
-    }
-
-    imageStore(u_dst, c, result);
-}
-",
-    }
-}
-
-// Compute divergence of velocity field
-mod cs_fluid_divergence {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   unused0;
-    int   unused1;
-    float unused2;
-    float dx;
-    float dy;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_vel;
-layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_div;
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(u_vel);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    ivec2 r = ivec2(min(c.x + 1, sz.x - 1), c.y);
-    ivec2 l = ivec2(max(c.x - 1, 0), c.y);
-    ivec2 d = ivec2(c.x, min(c.y + 1, sz.y - 1));
-    ivec2 u = ivec2(c.x, max(c.y - 1, 0));
-
-    float vx_r = imageLoad(u_vel, r).r;
-    float vx_l = imageLoad(u_vel, l).r;
-    float vy_d = imageLoad(u_vel, d).g;
-    float vy_u = imageLoad(u_vel, u).g;
-
-    // Central difference divergence with sign convention for Poisson solve
-    float div = -0.5 * (vx_r - vx_l + vy_d - vy_u);
-    imageStore(u_div, c, vec4(div, 0.0, 0.0, 0.0));
-}
-",
-    }
-}
-
-// One Jacobi iteration for the Poisson pressure solve
-mod cs_fluid_jacobi {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   unused0;
-    int   unused1;
-    float alpha;
-    float dx;
-    float dy;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_div;
-layout(set = 0, binding = 1, rgba16f) uniform readonly image2D u_p;
-layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_p_next;
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(u_div);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    ivec2 r = ivec2(min(c.x + 1, sz.x - 1), c.y);
-    ivec2 l = ivec2(max(c.x - 1, 0), c.y);
-    ivec2 d = ivec2(c.x, min(c.y + 1, sz.y - 1));
-    ivec2 u = ivec2(c.x, max(c.y - 1, 0));
-
-    float p_l = imageLoad(u_p, l).r;
-    float p_r = imageLoad(u_p, r).r;
-    float p_u = imageLoad(u_p, u).r;
-    float p_d = imageLoad(u_p, d).r;
-    float div = imageLoad(u_div, c).r;
-
-    // Jacobi: p_new = (p_left + p_right + p_up + p_down + alpha * div) / beta
-    // For Poisson: alpha = -1, beta = 4, or with our sign convention alpha = 1
-    float p_new = (p_l + p_r + p_u + p_d + pc.alpha * div) / 4.0;
-    imageStore(u_p_next, c, vec4(p_new, 0.0, 0.0, 0.0));
-}
-",
-    }
-}
-
-// Subtract pressure gradient from velocity to make it divergence-free
-// Reads velocity_in + pressure, writes corrected velocity_out
-mod cs_fluid_gradient_subtract {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   unused0;
-    int   unused1;
-    float unused2;
-    float dx;
-    float dy;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_p;
-layout(set = 0, binding = 1, rgba16f) uniform readonly image2D u_vel_in;
-layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_vel_out;
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(u_vel_in);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    ivec2 r = ivec2(min(c.x + 1, sz.x - 1), c.y);
-    ivec2 l = ivec2(max(c.x - 1, 0), c.y);
-    ivec2 d = ivec2(c.x, min(c.y + 1, sz.y - 1));
-    ivec2 up = ivec2(c.x, max(c.y - 1, 0));
-
-    float p_r = imageLoad(u_p, r).r;
-    float p_l = imageLoad(u_p, l).r;
-    float p_d = imageLoad(u_p, d).r;
-    float p_u = imageLoad(u_p, up).r;
-
-    vec2 vel = imageLoad(u_vel_in, c).rg;
-    vel.x -= 0.5 * (p_r - p_l);
-    vel.y -= 0.5 * (p_d - p_u);
-    imageStore(u_vel_out, c, vec4(vel.x, vel.y, 0.0, 0.0));
-}
-",
-    }
-}
-
-// Compute buoyancy force from density gradient and add to existing velocity.
-// Runs every frame so the density gradient continuously drives the flow.
-// Without this, the projection step (Helmholtz-Hodge) would cancel any
-// purely-gradient velocity field, leaving v=0.
-mod cs_fluid_add_buoyancy {
-    vulkano_shaders::shader! {
-        ty: "compute",
-        src: r"
-#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(push_constant) uniform PC {
-    int   unused0;
-    int   unused1;
-    float dt;
-    float dx;
-    float dy;
-} pc;
-
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_feedback;
-layout(set = 0, binding = 1, rgba16f) uniform image2D u_vel;
-
-float luminance(vec3 c) {
-    return dot(c, vec3(0.299, 0.587, 0.114));
-}
-
-void main() {
-    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 sz = imageSize(u_vel);
-    if (c.x >= sz.x || c.y >= sz.y) return;
-
-    ivec2 r = ivec2(min(c.x + 1, sz.x - 1), c.y);
-    ivec2 l = ivec2(max(c.x - 1, 0), c.y);
-    ivec2 d = ivec2(c.x, min(c.y + 1, sz.y - 1));
-    ivec2 up = ivec2(c.x, max(c.y - 1, 0));
-
-    float lum_r = luminance(imageLoad(u_feedback, r).rgb);
-    float lum_l = luminance(imageLoad(u_feedback, l).rgb);
-    float lum_d = luminance(imageLoad(u_feedback, d).rgb);
-    float lum_u = luminance(imageLoad(u_feedback, up).rgb);
-
-    vec2 grad = vec2(lum_r - lum_l, lum_d - lum_u) * pc.dt;
-    vec2 existing_vel = imageLoad(u_vel, c).rg;
-    imageStore(u_vel, c, vec4(existing_vel * pc.dx + grad, 0.0, 0.0));
-}
-",
-    }
-}
 
 mod fs_present {
     vulkano_shaders::shader! {
@@ -528,7 +159,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             slides_path: std::path::PathBuf::new(),
-            transition_type: TransitionType::Smooth,
+            transition_type: TransitionType::Fluid,
             transition_duration: 0.5,
         }
     }
@@ -547,7 +178,7 @@ Commands:
   init <path>                  Create an example presentation at <path>
 
 Options:
-  --transition-type <type>     Transition style: smooth (default), instant, slide, or fluid
+  --transition-type <type>     Transition style: fluid (default), smooth, instant, or slide
   --transition-duration <sec>  Transition duration in seconds (default: 0.5)
   --help                       Show this help
 
@@ -701,8 +332,11 @@ pub fn init_example_presentation(path: &std::path::Path) {
 
             let mut img = image::RgbaImage::new(width, height);
 
-            let rect_count = rng.gen_range(5..=12);
-            for _ in 0..rect_count {
+            let total_pixels = width as u64 * height as u64;
+            let min_covered = (total_pixels as f64 * 0.15) as u64;
+            let mut covered: u64 = 0;
+
+            while covered < min_covered {
                 let rx = rng.gen_range(0..width.saturating_sub(50).max(1));
                 let ry = rng.gen_range(0..height.saturating_sub(50).max(1));
                 let max_w = (width - rx).min(400);
@@ -712,13 +346,13 @@ pub fn init_example_presentation(path: &std::path::Path) {
                 let rr = rng.gen_range(30..=220);
                 let rg = rng.gen_range(30..=220);
                 let rb = rng.gen_range(30..=220);
-                let ra = rng.gen_range(60..=200);
 
                 for py in ry..ry + rh {
                     for px in rx..rx + rw {
-                        img.put_pixel(px, py, image::Rgba([rr, rg, rb, ra]));
+                        img.put_pixel(px, py, image::Rgba([rr, rg, rb, 255]));
                     }
                 }
+                covered += (rw * rh) as u64;
             }
 
             img.save(&filepath).expect("Failed to save slide image");
@@ -744,69 +378,25 @@ pub struct GpuResources {
     pub direct_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
     pub direct_pipeline_layout: Arc<PipelineLayout>,
 
-    // Smooth transition pipelines
-    pub blur_h_pipeline: Arc<ComputePipeline>,
-    pub blur_v_pipeline: Arc<ComputePipeline>,
-    pub blur_pipeline_layout: Arc<PipelineLayout>,
+    // Present pipeline and descriptor set
     pub present_pipeline: Arc<vulkano::pipeline::graphics::GraphicsPipeline>,
     pub present_pipeline_layout: Arc<PipelineLayout>,
+    pub present_descriptor_set: Arc<DescriptorSet>,
 
     // Slides sampler descriptor set (shared by direct and present pipelines)
     pub slides_descriptor_set: Arc<DescriptorSet>,
 
-    // Feedback texture (single buffer, blurred in-place via ping)
+    // Feedback texture (single buffer, reused by smooth and fluid)
     pub feedback: Arc<Image>,
     pub feedback_view: Arc<ImageView>,
     pub ping_image: Arc<Image>,
     pub ping_view: Arc<ImageView>,
     pub sampler: Arc<Sampler>,
 
-    // Present descriptor set (renders feedback to swapchain)
-    pub present_descriptor_set: Arc<DescriptorSet>,
-
-    // Blur descriptor sets
-    pub blur_h_descriptor_set: Arc<DescriptorSet>, // feedback → ping
-    pub blur_v_descriptor_set: Arc<DescriptorSet>, // ping → feedback
-
-    // Stable fluids simulation resources
-    pub velocity: Arc<Image>,
-    pub velocity_view: Arc<ImageView>,
-    pub velocity_ping: Arc<Image>,
-    pub velocity_ping_view: Arc<ImageView>,
-    pub pressure: Arc<Image>,
-    pub pressure_view: Arc<ImageView>,
-    pub pressure_ping: Arc<Image>,
-    pub pressure_ping_view: Arc<ImageView>,
-    pub divergence: Arc<Image>,
-    pub divergence_view: Arc<ImageView>,
-
-    // Fluid pipeline layouts and descriptor set layouts
-    pub fluid_2binding_ds_layout: Arc<DescriptorSetLayout>,
-    pub fluid_2binding_layout: Arc<PipelineLayout>,
-    pub fluid_3binding_ds_layout: Arc<DescriptorSetLayout>,
-    pub fluid_3binding_layout: Arc<PipelineLayout>,
-
-    // Fluid compute pipelines
-    pub fluid_advect_pipeline: Arc<ComputePipeline>,
-    pub fluid_divergence_pipeline: Arc<ComputePipeline>,
-    pub fluid_jacobi_pipeline: Arc<ComputePipeline>,
-    pub fluid_gradient_subtract_pipeline: Arc<ComputePipeline>,
-    pub fluid_init_velocity_pipeline: Arc<ComputePipeline>,
-
-    // Fluid descriptor sets (pre-built for all simulation steps)
-    pub fluid_advect_velocity_ds: Arc<DescriptorSet>,    // velocity, velocity, velocity_ping
-    pub fluid_advect_density_h_ds: Arc<DescriptorSet>,    // feedback, velocity, ping
-    pub fluid_advect_density_v_ds: Arc<DescriptorSet>,    // ping, velocity, feedback
-    pub fluid_divergence_ds: Arc<DescriptorSet>,          // velocity_ping, divergence
-    pub fluid_jacobi_h_ds: Arc<DescriptorSet>,            // divergence, pressure, pressure_ping
-    pub fluid_jacobi_v_ds: Arc<DescriptorSet>,            // divergence, pressure_ping, pressure
-    pub fluid_gradient_subtract_ds: Arc<DescriptorSet>,   // pressure, velocity_ping, velocity
-    pub fluid_init_velocity_ds: Arc<DescriptorSet>,       // feedback, velocity
-
-    // Blend descriptor set and pipeline (slide → feedback, first frame only)
-    pub blend_pipeline: Arc<ComputePipeline>,
-    pub blend_pipeline_layout: Arc<PipelineLayout>,
-    pub blend_descriptor_set: Arc<DescriptorSet>,
+    // Transition-specific resources
+    pub smooth: transitions::smooth::SmoothResources,
+    pub fluid: transitions::fluid::FluidResources,
+    pub blend: transitions::BlendResources,
 
     pub window: Arc<winit::window::Window>,
 }
@@ -1181,83 +771,11 @@ pub fn create_app(
         },
     )?;
 
-    // Helper: create rgba16f storage image for fluid simulation
-    let make_fluid_image = |allocator: &Arc<StandardMemoryAllocator>, extent: [u32; 2]| -> Result<(Arc<Image>, Arc<ImageView>), Box<dyn std::error::Error>> {
-        let img = Image::new(
-            allocator.clone() as Arc<dyn vulkano::memory::allocator::MemoryAllocator>,
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::R16G16B16A16_SFLOAT,
-                extent: [extent[0], extent[1], 1],
-                array_layers: 1,
-                mip_levels: 1,
-                usage: ImageUsage::STORAGE | ImageUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo::default(),
-        )?;
-        let view = ImageView::new(
-            img.clone(),
-            ImageViewCreateInfo {
-                view_type: ImageViewType::Dim2d,
-                format: Format::R16G16B16A16_SFLOAT,
-                subresource_range: ImageSubresourceRange {
-                    aspects: ImageAspects::COLOR,
-                    mip_levels: 0..1,
-                    array_layers: 0..1,
-                },
-                ..Default::default()
-            },
-        )?;
-        Ok((img, view))
-    };
-
-    let (velocity, velocity_view) = make_fluid_image(&memory_allocator, extent2)?;
-    let (velocity_ping, velocity_ping_view) = make_fluid_image(&memory_allocator, extent2)?;
-    let (pressure, pressure_view) = make_fluid_image(&memory_allocator, extent2)?;
-    let (pressure_ping, pressure_ping_view) = make_fluid_image(&memory_allocator, extent2)?;
-    let (divergence, divergence_view) = make_fluid_image(&memory_allocator, extent2)?;
-
-    // Clear feedback and ping buffers so the IIR feedback loop starts
-    // from black instead of undefined GPU memory.
-    {
-        let mut clear_builder = AutoCommandBufferBuilder::primary(
-            cmd_allocator.clone(),
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .map_err(|e| format!("clear cmd builder: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(feedback_img.clone()))
-            .map_err(|e| format!("clear feedback: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(ping_image.clone()))
-            .map_err(|e| format!("clear ping: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(velocity.clone()))
-            .map_err(|e| format!("clear velocity: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(velocity_ping.clone()))
-            .map_err(|e| format!("clear velocity_ping: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(pressure.clone()))
-            .map_err(|e| format!("clear pressure: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(pressure_ping.clone()))
-            .map_err(|e| format!("clear pressure_ping: {e}"))?;
-        clear_builder
-            .clear_color_image(ClearColorImageInfo::image(divergence.clone()))
-            .map_err(|e| format!("clear divergence: {e}"))?;
-        clear_builder
-            .build()
-            .map_err(|e| format!("build clear cb: {e}"))?
-            .execute(queue.clone())
-            .map_err(|e| format!("execute clear: {e}"))?
-            .then_signal_fence_and_flush()
-            .map_err(|e| format!("flush clear: {e}"))?
-            .wait(None)
-            .map_err(|e| format!("wait clear: {e}"))?;
-    }
+    // Create descriptor set allocator
+    let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+        device.clone(),
+        Default::default(),
+    ));
 
     // Shared descriptor set for slides
     let slides_descriptor_set_layout = DescriptorSetLayout::new(
@@ -1275,11 +793,6 @@ pub fn create_app(
         },
     )?;
 
-    let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-        device.clone(),
-        Default::default(),
-    ));
-
     let slides_descriptor_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
         slides_descriptor_set_layout.clone(),
@@ -1292,78 +805,7 @@ pub fn create_app(
     )
     .map_err(|e| format!("slides descriptor_set: {e}"))?;
 
-    // Direct pipeline layout (for Instant/Slide and non-transitioning)
-    let direct_pipeline_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![slides_descriptor_set_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::FRAGMENT,
-                offset: 0,
-                size: 20,
-            }],
-            ..Default::default()
-        },
-    )?;
-
-    let vs_module = vs::load(device.clone())
-        .map_err(|e| format!("vs load: {e}"))?;
-    let cs_blur_module = cs_blur::load(device.clone())
-        .map_err(|e| format!("cs_blur load: {e}"))?;
-    let cs_blur_v_module = cs_blur_v::load(device.clone())
-        .map_err(|e| format!("cs_blur_v load: {e}"))?;
-    let fs_present_module = fs_present::load(device.clone())
-        .map_err(|e| format!("fs_present load: {e}"))?;
-    let fs_direct_module = fs_direct::load(device.clone())
-        .map_err(|e| format!("fs_direct load: {e}"))?;
-    let cs_blend_slide_module = cs_blend_slide::load(device.clone())
-        .map_err(|e| format!("cs_blend_slide load: {e}"))?;
-    let cs_fluid_advect_module = cs_fluid_advect::load(device.clone())
-        .map_err(|e| format!("cs_fluid_advect load: {e}"))?;
-    let cs_fluid_divergence_module = cs_fluid_divergence::load(device.clone())
-        .map_err(|e| format!("cs_fluid_divergence load: {e}"))?;
-    let cs_fluid_jacobi_module = cs_fluid_jacobi::load(device.clone())
-        .map_err(|e| format!("cs_fluid_jacobi load: {e}"))?;
-    let cs_fluid_gradient_subtract_module = cs_fluid_gradient_subtract::load(device.clone())
-        .map_err(|e| format!("cs_fluid_gradient_subtract load: {e}"))?;
-    let cs_fluid_init_velocity_module = cs_fluid_add_buoyancy::load(device.clone())
-        .map_err(|e| format!("cs_fluid_add_buoyancy load: {e}"))?;
-
-    let vs_entry = vs_module
-        .entry_point("main")
-        .ok_or("Vertex shader entry point 'main' not found")?;
-    let cs_blur_entry = cs_blur_module
-        .entry_point("main")
-        .ok_or("Cs_blur compute shader entry point 'main' not found")?;
-    let cs_blur_v_entry = cs_blur_v_module
-        .entry_point("main")
-        .ok_or("Cs_blur_v compute shader entry point 'main' not found")?;
-    let cs_blend_slide_entry = cs_blend_slide_module
-        .entry_point("main")
-        .ok_or("Cs_blend_slide compute shader entry point 'main' not found")?;
-    let cs_fluid_advect_entry = cs_fluid_advect_module
-        .entry_point("main")
-        .ok_or("Cs_fluid_advect compute shader entry point 'main' not found")?;
-    let cs_fluid_divergence_entry = cs_fluid_divergence_module
-        .entry_point("main")
-        .ok_or("Cs_fluid_divergence compute shader entry point 'main' not found")?;
-    let cs_fluid_jacobi_entry = cs_fluid_jacobi_module
-        .entry_point("main")
-        .ok_or("Cs_fluid_jacobi compute shader entry point 'main' not found")?;
-    let cs_fluid_gradient_subtract_entry = cs_fluid_gradient_subtract_module
-        .entry_point("main")
-        .ok_or("Cs_fluid_gradient_subtract compute shader entry point 'main' not found")?;
-    let cs_fluid_init_velocity_entry = cs_fluid_init_velocity_module
-        .entry_point("main")
-        .ok_or("Cs_fluid_add_buoyancy compute shader entry point 'main' not found")?;
-    let fs_present_entry = fs_present_module
-        .entry_point("main")
-        .ok_or("Fs_present fragment shader entry point 'main' not found")?;
-    let fs_direct_entry = fs_direct_module
-        .entry_point("main")
-        .ok_or("Fs_direct fragment shader entry point 'main' not found")?;
-
-    // Present pipeline (composites slide over blurred feedback for swapchain)
+    // Present descriptor set layout
     let present_descriptor_set_layout = DescriptorSetLayout::new(
         device.clone(),
         DescriptorSetLayoutCreateInfo {
@@ -1378,23 +820,72 @@ pub fn create_app(
         },
     )?;
 
-    let present_pipeline_layout = PipelineLayout::new(
+    // Create transition-specific resources
+    let smooth = transitions::smooth::create_smooth_resources(
         device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![
-                present_descriptor_set_layout.clone(),
-                slides_descriptor_set_layout.clone(),
-            ],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::FRAGMENT,
-                offset: 0,
-                size: 20,
-            }],
-            ..Default::default()
-        },
+        feedback_view.clone(),
+        ping_view.clone(),
+        descriptor_set_allocator.clone(),
     )?;
 
-    // Create present descriptor set (reads feedback, outputs to swapchain)
+    let fluid = transitions::fluid::create_fluid_resources(
+        device.clone(),
+        memory_allocator.clone(),
+        descriptor_set_allocator.clone(),
+        feedback_view.clone(),
+        ping_view.clone(),
+        extent2,
+    )?;
+
+    let blend = transitions::create_blend_resources(
+        device.clone(),
+        feedback_view.clone(),
+        texture_view.clone(),
+        sampler.clone(),
+        descriptor_set_allocator.clone(),
+    )?;
+
+    // Clear feedback, ping, and all fluid simulation images
+    {
+        let mut clear_builder = AutoCommandBufferBuilder::primary(
+            cmd_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .map_err(|e| format!("clear cmd builder: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(feedback_img.clone()))
+            .map_err(|e| format!("clear feedback: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(ping_image.clone()))
+            .map_err(|e| format!("clear ping: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(fluid.velocity.clone()))
+            .map_err(|e| format!("clear velocity: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(fluid.velocity_ping.clone()))
+            .map_err(|e| format!("clear velocity_ping: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(fluid.pressure.clone()))
+            .map_err(|e| format!("clear pressure: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(fluid.pressure_ping.clone()))
+            .map_err(|e| format!("clear pressure_ping: {e}"))?;
+        clear_builder
+            .clear_color_image(ClearColorImageInfo::image(fluid.divergence.clone()))
+            .map_err(|e| format!("clear divergence: {e}"))?;
+        clear_builder
+            .build()
+            .map_err(|e| format!("build clear cb: {e}"))?
+            .execute(queue.clone())
+            .map_err(|e| format!("execute clear: {e}"))?
+            .then_signal_fence_and_flush()
+            .map_err(|e| format!("flush clear: {e}"))?
+            .wait(None)
+            .map_err(|e| format!("wait clear: {e}"))?;
+    }
+
+    // Present descriptor set (reads feedback, outputs to swapchain)
     let present_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
         present_descriptor_set_layout.clone(),
@@ -1411,6 +902,55 @@ pub fn create_app(
         [],
     )
     .map_err(|e| format!("present descriptor_set: {e}"))?;
+
+    // Direct pipeline layout (for Instant/Slide and non-transitioning)
+    let direct_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![slides_descriptor_set_layout.clone()],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::FRAGMENT,
+                offset: 0,
+                size: 20,
+            }],
+            ..Default::default()
+        },
+    )?;
+
+    // Present pipeline layout (feedback + slides)
+    let present_pipeline_layout = PipelineLayout::new(
+        device.clone(),
+        PipelineLayoutCreateInfo {
+            set_layouts: vec![
+                present_descriptor_set_layout.clone(),
+                slides_descriptor_set_layout.clone(),
+            ],
+            push_constant_ranges: vec![PushConstantRange {
+                stages: vulkano::shader::ShaderStages::FRAGMENT,
+                offset: 0,
+                size: 20,
+            }],
+            ..Default::default()
+        },
+    )?;
+
+    // Load common shader modules
+    let vs_module = vs::load(device.clone())
+        .map_err(|e| format!("vs load: {e}"))?;
+    let fs_present_module = fs_present::load(device.clone())
+        .map_err(|e| format!("fs_present load: {e}"))?;
+    let fs_direct_module = fs_direct::load(device.clone())
+        .map_err(|e| format!("fs_direct load: {e}"))?;
+
+    let vs_entry = vs_module
+        .entry_point("main")
+        .ok_or("Vertex shader entry point 'main' not found")?;
+    let fs_present_entry = fs_present_module
+        .entry_point("main")
+        .ok_or("Fs_present fragment shader entry point 'main' not found")?;
+    let fs_direct_entry = fs_direct_module
+        .entry_point("main")
+        .ok_or("Fs_direct fragment shader entry point 'main' not found")?;
 
     let present_pipeline =
         vulkano::pipeline::graphics::GraphicsPipeline::new(
@@ -1493,344 +1033,6 @@ pub fn create_app(
         )
         .map_err(|e| format!("direct_pipeline: {e}"))?;
 
-    // Compute blur pipeline layout
-    let blur_descriptor_set_layout = DescriptorSetLayout::new(
-        device.clone(),
-        DescriptorSetLayoutCreateInfo {
-            bindings: std::collections::BTreeMap::from([
-                (0u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-                (1u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-            ]),
-            ..Default::default()
-        },
-    )?;
-
-    let blur_pipeline_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![blur_descriptor_set_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::COMPUTE,
-                offset: 0,
-                size: 20,
-            }],
-            ..Default::default()
-        },
-    )?;
-
-    // Create blur descriptor sets (feedback → ping, ping → feedback)
-    let make_blur_set = |src: Arc<ImageView>, dst: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
-        DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            blur_descriptor_set_layout.clone(),
-            [
-                WriteDescriptorSet::image_view_with_layout(
-                    0,
-                    DescriptorImageViewInfo {
-                        image_view: src,
-                        image_layout: ImageLayout::General,
-                    },
-                ),
-                WriteDescriptorSet::image_view_with_layout(
-                    1,
-                    DescriptorImageViewInfo {
-                        image_view: dst,
-                        image_layout: ImageLayout::General,
-                    },
-                ),
-            ],
-            [],
-        )
-        .map_err(|e| format!("blur descriptor_set: {e}").into())
-    };
-
-    let blur_h_set = make_blur_set(feedback_view.clone(), ping_view.clone())?;
-    let blur_v_set = make_blur_set(ping_view.clone(), feedback_view.clone())?;
-
-    let blur_h_pipeline = ComputePipeline::new(
-        device.clone(),
-        None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_blur_entry),
-            blur_pipeline_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("blur_h_pipeline: {e}"))?;
-
-    let blur_v_pipeline = ComputePipeline::new(
-        device.clone(),
-        None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_blur_v_entry),
-            blur_pipeline_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("blur_v_pipeline: {e}"))?;
-
-    // ------------------------------------------------------------------
-    // Stable fluids simulation pipelines
-    // ------------------------------------------------------------------
-
-    // 2-binding DS layout (used by: divergence, init_velocity)
-    let fluid_2binding_ds_layout = DescriptorSetLayout::new(
-        device.clone(),
-        DescriptorSetLayoutCreateInfo {
-            bindings: std::collections::BTreeMap::from([
-                (0u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-                (1u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-            ]),
-            ..Default::default()
-        },
-    )?;
-
-    let fluid_2binding_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![fluid_2binding_ds_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::COMPUTE,
-                offset: 0,
-                size: 20,
-            }],
-            ..Default::default()
-        },
-    )?;
-
-    // 3-binding DS layout (used by: advect, jacobi, gradient_subtract)
-    let fluid_3binding_ds_layout = DescriptorSetLayout::new(
-        device.clone(),
-        DescriptorSetLayoutCreateInfo {
-            bindings: std::collections::BTreeMap::from([
-                (0u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-                (1u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-                (2u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-            ]),
-            ..Default::default()
-        },
-    )?;
-
-    let fluid_3binding_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![fluid_3binding_ds_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::COMPUTE,
-                offset: 0,
-                size: 20,
-            }],
-            ..Default::default()
-        },
-    )?;
-
-    let make_2binding_set = |b0: Arc<ImageView>, b1: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
-        DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            fluid_2binding_ds_layout.clone(),
-            [
-                WriteDescriptorSet::image_view_with_layout(
-                    0, DescriptorImageViewInfo { image_view: b0, image_layout: ImageLayout::General },
-                ),
-                WriteDescriptorSet::image_view_with_layout(
-                    1, DescriptorImageViewInfo { image_view: b1, image_layout: ImageLayout::General },
-                ),
-            ],
-            [],
-        )
-        .map_err(|e| format!("fluid 2binding ds: {e}").into())
-    };
-
-    let make_3binding_set = |b0: Arc<ImageView>, b1: Arc<ImageView>, b2: Arc<ImageView>| -> Result<Arc<DescriptorSet>, Box<dyn std::error::Error>> {
-        DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            fluid_3binding_ds_layout.clone(),
-            [
-                WriteDescriptorSet::image_view_with_layout(
-                    0, DescriptorImageViewInfo { image_view: b0, image_layout: ImageLayout::General },
-                ),
-                WriteDescriptorSet::image_view_with_layout(
-                    1, DescriptorImageViewInfo { image_view: b1, image_layout: ImageLayout::General },
-                ),
-                WriteDescriptorSet::image_view_with_layout(
-                    2, DescriptorImageViewInfo { image_view: b2, image_layout: ImageLayout::General },
-                ),
-            ],
-            [],
-        )
-        .map_err(|e| format!("fluid 3binding ds: {e}").into())
-    };
-
-    // Fluid compute pipelines
-    let fluid_advect_pipeline = ComputePipeline::new(
-        device.clone(), None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_fluid_advect_entry),
-            fluid_3binding_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("fluid_advect_pipeline: {e}"))?;
-
-    let fluid_divergence_pipeline = ComputePipeline::new(
-        device.clone(), None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_fluid_divergence_entry),
-            fluid_2binding_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("fluid_divergence_pipeline: {e}"))?;
-
-    let fluid_jacobi_pipeline = ComputePipeline::new(
-        device.clone(), None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_fluid_jacobi_entry),
-            fluid_3binding_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("fluid_jacobi_pipeline: {e}"))?;
-
-    let fluid_gradient_subtract_pipeline = ComputePipeline::new(
-        device.clone(), None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_fluid_gradient_subtract_entry),
-            fluid_3binding_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("fluid_gradient_subtract_pipeline: {e}"))?;
-
-    let fluid_init_velocity_pipeline = ComputePipeline::new(
-        device.clone(), None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_fluid_init_velocity_entry),
-            fluid_2binding_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("fluid_init_velocity_pipeline: {e}"))?;
-
-    // Fluid descriptor sets (pre-built for all simulation steps)
-    // Advection: velocity field → self-advect to velocity_ping
-    let fluid_advect_velocity_ds = make_3binding_set(
-        velocity_view.clone(), velocity_view.clone(), velocity_ping_view.clone(),
-    )?;
-    // Advection: density feedback → ping (using velocity field)
-    let fluid_advect_density_h_ds = make_3binding_set(
-        feedback_view.clone(), velocity_view.clone(), ping_view.clone(),
-    )?;
-    // Advection: density ping → feedback (using velocity field)
-    let fluid_advect_density_v_ds = make_3binding_set(
-        ping_view.clone(), velocity_view.clone(), feedback_view.clone(),
-    )?;
-    // Divergence: velocity_ping → divergence
-    let fluid_divergence_ds = make_2binding_set(
-        velocity_ping_view.clone(), divergence_view.clone(),
-    )?;
-    // Jacobi H: divergence, pressure → pressure_ping
-    let fluid_jacobi_h_ds = make_3binding_set(
-        divergence_view.clone(), pressure_view.clone(), pressure_ping_view.clone(),
-    )?;
-    // Jacobi V: divergence, pressure_ping → pressure
-    let fluid_jacobi_v_ds = make_3binding_set(
-        divergence_view.clone(), pressure_ping_view.clone(), pressure_view.clone(),
-    )?;
-    // Gradient subtract: pressure, velocity_ping → velocity
-    let fluid_gradient_subtract_ds = make_3binding_set(
-        pressure_view.clone(), velocity_ping_view.clone(), velocity_view.clone(),
-    )?;
-    // Init velocity: feedback → velocity
-    let fluid_init_velocity_ds = make_2binding_set(
-        feedback_view.clone(), velocity_view.clone(),
-    )?;
-
-    // Blend pipeline: blends current slide into feedback buffer (first frame only)
-    let blend_descriptor_set_layout = DescriptorSetLayout::new(
-        device.clone(),
-        DescriptorSetLayoutCreateInfo {
-            bindings: std::collections::BTreeMap::from([
-                (0u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
-                }),
-                (1u32, DescriptorSetLayoutBinding {
-                    descriptor_count: 1,
-                    stages: vulkano::shader::ShaderStages::COMPUTE,
-                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
-                }),
-            ]),
-            ..Default::default()
-        },
-    )?;
-
-    let blend_pipeline_layout = PipelineLayout::new(
-        device.clone(),
-        PipelineLayoutCreateInfo {
-            set_layouts: vec![blend_descriptor_set_layout.clone()],
-            push_constant_ranges: vec![PushConstantRange {
-                stages: vulkano::shader::ShaderStages::COMPUTE,
-                offset: 0,
-                size: 20,
-            }],
-            ..Default::default()
-        },
-    )?;
-
-    let blend_descriptor_set = DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        blend_descriptor_set_layout.clone(),
-        [
-            WriteDescriptorSet::image_view_with_layout(
-                0,
-                DescriptorImageViewInfo {
-                    image_view: feedback_view.clone(),
-                    image_layout: ImageLayout::General,
-                },
-            ),
-            WriteDescriptorSet::image_view_sampler(
-                1,
-                texture_view.clone(),
-                sampler.clone(),
-            ),
-        ],
-        [],
-    )
-    .map_err(|e| format!("blend descriptor_set: {e}"))?;
-
-    let blend_pipeline = ComputePipeline::new(
-        device.clone(),
-        None,
-        ComputePipelineCreateInfo::stage_layout(
-            PipelineShaderStageCreateInfo::new(cs_blend_slide_entry),
-            blend_pipeline_layout.clone(),
-        ),
-    )
-    .map_err(|e| format!("blend_pipeline: {e}"))?;
-
     if let Some(meta) = collection.meta(0) {
         println!("{}", texture::format_slide_display(meta, 0, collection.len()));
     }
@@ -1845,50 +1047,18 @@ pub fn create_app(
             swapchain_image_views,
             direct_pipeline,
             direct_pipeline_layout,
-            blur_h_pipeline,
-            blur_v_pipeline,
-            blur_pipeline_layout,
-            velocity,
-            velocity_view,
-            velocity_ping,
-            velocity_ping_view,
-            pressure,
-            pressure_view,
-            pressure_ping,
-            pressure_ping_view,
-            divergence,
-            divergence_view,
-            fluid_2binding_ds_layout,
-            fluid_2binding_layout,
-            fluid_3binding_ds_layout,
-            fluid_3binding_layout,
-            fluid_advect_pipeline,
-            fluid_divergence_pipeline,
-            fluid_jacobi_pipeline,
-            fluid_gradient_subtract_pipeline,
-            fluid_init_velocity_pipeline,
-            fluid_advect_velocity_ds,
-            fluid_advect_density_h_ds,
-            fluid_advect_density_v_ds,
-            fluid_divergence_ds,
-            fluid_jacobi_h_ds,
-            fluid_jacobi_v_ds,
-            fluid_gradient_subtract_ds,
-            fluid_init_velocity_ds,
             present_pipeline,
             present_pipeline_layout,
+            present_descriptor_set: present_set,
             slides_descriptor_set,
             feedback: feedback_img,
             feedback_view,
             ping_image,
             ping_view,
             sampler,
-            present_descriptor_set: present_set,
-            blur_h_descriptor_set: blur_h_set,
-            blur_v_descriptor_set: blur_v_set,
-            blend_pipeline,
-            blend_pipeline_layout,
-            blend_descriptor_set,
+            smooth,
+            fluid,
+            blend,
             window,
         },
         collection,
@@ -1965,12 +1135,12 @@ fn create_swapchain(
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
-struct PushConstants {
-    current_layer: i32,
-    previous_layer: i32,
-    blur_radius: f32,
-    slide_offset_x: f32,
-    slide_offset_y: f32,
+pub(crate) struct PushConstants {
+    pub(crate) current_layer: i32,
+    pub(crate) previous_layer: i32,
+    pub(crate) blur_radius: f32,
+    pub(crate) slide_offset_x: f32,
+    pub(crate) slide_offset_y: f32,
 }
 
 impl App {
@@ -2137,190 +1307,21 @@ impl App {
         {
             // Pass 0: Blend previous slide into feedback (first frame only)
             if self.is_transitioning && !self.transition_blended {
-                builder
-                    .bind_pipeline_compute(res.blend_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.blend_pipeline_layout.clone(),
-                        0,
-                        res.blend_descriptor_set.clone(),
-                    )?
-                    .push_constants(res.blend_pipeline_layout.clone(), 0, pc)?;
-                unsafe {
-                    builder.dispatch([
-                        (extent[0] + 15) / 16,
-                        (extent[1] + 15) / 16,
-                        1,
-                    ])?;
-                }
+                transitions::record_blend_pass(&mut builder, &res.blend, pc, [extent[0], extent[1]])?;
             }
 
-            // --- Stable fluids simulation ---
             if self.config.transition_type == TransitionType::Fluid {
-                let ext_x = (extent[0] + 15) / 16;
-                let ext_y = (extent[1] + 15) / 16;
-
-                // Add buoyancy force from density gradient to velocity (every frame).
-                // The Helmholtz-Hodge projection removes the curl-free (gradient)
-                // component of velocity, so a purely gradient velocity would be
-                // canceled to zero. By adding the gradient every frame and then
-                // self-advecting, the velocity develops a divergence-free component
-                // that survives projection and drives meaningful flow.
-                {
-                    let damping = (-self.last_frame_dt * 3.0).exp();
-                    let buoy_pc = PushConstants {
-                        current_layer: 0, previous_layer: 0,
-                        blur_radius: self.last_frame_dt * 50.0,
-                        slide_offset_x: damping, slide_offset_y: 1.0,
-                    };
-                    builder
-                        .bind_pipeline_compute(res.fluid_init_velocity_pipeline.clone())?
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            res.fluid_2binding_layout.clone(), 0,
-                            res.fluid_init_velocity_ds.clone(),
-                        )?
-                        .push_constants(res.fluid_2binding_layout.clone(), 0, buoy_pc)?;
-                    unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
-                }
-
-                // PC template for advection steps
-                let advect_pc = PushConstants {
-                    current_layer: 0, previous_layer: 0,
-                    blur_radius: 0.5,   // dt (two substeps = 1.0 total per frame)
-                    slide_offset_x: 1.0, slide_offset_y: 1.0,
-                };
-
-                // PC for divergence / gradient subtract (dx, dy = 1.0 in pixel space)
-                let identity_pc = PushConstants {
-                    current_layer: 0, previous_layer: 0,
-                    blur_radius: 0.0,
-                    slide_offset_x: 1.0, slide_offset_y: 1.0,
-                };
-
-                // PC for Jacobi
-                let jacobi_pc = PushConstants {
-                    current_layer: 0, previous_layer: 0,
-                    blur_radius: 1.0,   // alpha
-                    slide_offset_x: 1.0, slide_offset_y: 1.0,
-                };
-
-                // 1. Self-advect velocity field: velocity → velocity_ping
-                builder
-                    .bind_pipeline_compute(res.fluid_advect_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.fluid_3binding_layout.clone(), 0,
-                        res.fluid_advect_velocity_ds.clone(),
-                    )?
-                    .push_constants(res.fluid_3binding_layout.clone(), 0, advect_pc)?;
-                unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
-
-                // 2. Compute divergence of velocity_ping → divergence
-                builder
-                    .bind_pipeline_compute(res.fluid_divergence_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.fluid_2binding_layout.clone(), 0,
-                        res.fluid_divergence_ds.clone(),
-                    )?
-                    .push_constants(res.fluid_2binding_layout.clone(), 0, identity_pc)?;
-                unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
-
-                // 3. Jacobi iterations: solve pressure Poisson (10 iters)
-                for i in 0..10 {
-                    let ds = if i % 2 == 0 {
-                        &res.fluid_jacobi_h_ds
-                    } else {
-                        &res.fluid_jacobi_v_ds
-                    };
-                    builder
-                        .bind_pipeline_compute(res.fluid_jacobi_pipeline.clone())?
-                        .bind_descriptor_sets(
-                            PipelineBindPoint::Compute,
-                            res.fluid_3binding_layout.clone(), 0,
-                            ds.clone(),
-                        )?
-                        .push_constants(res.fluid_3binding_layout.clone(), 0, jacobi_pc)?;
-                    unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
-                }
-
-                // 4. Subtract pressure gradient: project velocity_ping → velocity
-                builder
-                    .bind_pipeline_compute(res.fluid_gradient_subtract_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.fluid_3binding_layout.clone(), 0,
-                        res.fluid_gradient_subtract_ds.clone(),
-                    )?
-                    .push_constants(res.fluid_3binding_layout.clone(), 0, identity_pc)?;
-                unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
-
-                // 5a. Advect density: feedback → ping
-                builder
-                    .bind_pipeline_compute(res.fluid_advect_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.fluid_3binding_layout.clone(), 0,
-                        res.fluid_advect_density_h_ds.clone(),
-                    )?
-                    .push_constants(res.fluid_3binding_layout.clone(), 0, advect_pc)?;
-                unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
-
-                // 5b. Advect density: ping → feedback
-                builder
-                    .bind_pipeline_compute(res.fluid_advect_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.fluid_3binding_layout.clone(), 0,
-                        res.fluid_advect_density_v_ds.clone(),
-                    )?
-                    .push_constants(res.fluid_3binding_layout.clone(), 0, advect_pc)?;
-                unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
+                transitions::fluid::record_fluid_simulation(&mut builder, &res.fluid, pc, self.last_frame_dt, [extent[0], extent[1]])?;
             } else {
-                // Pass 1: Horizontal blur (feedback → ping)
-                builder
-                    .bind_pipeline_compute(res.blur_h_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.blur_pipeline_layout.clone(),
-                        0,
-                        res.blur_h_descriptor_set.clone(),
-                    )?
-                    .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
-                unsafe {
-                    builder.dispatch([
-                        (extent[0] + 15) / 16,
-                        (extent[1] + 15) / 16,
-                        1,
-                    ])?;
-                }
-
-                // Pass 2: Vertical blur (ping → feedback)
-                builder
-                    .bind_pipeline_compute(res.blur_v_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Compute,
-                        res.blur_pipeline_layout.clone(),
-                        0,
-                        res.blur_v_descriptor_set.clone(),
-                    )?
-                    .push_constants(res.blur_pipeline_layout.clone(), 0, pc)?;
-                unsafe {
-                    builder.dispatch([
-                        (extent[0] + 15) / 16,
-                        (extent[1] + 15) / 16,
-                        1,
-                    ])?;
-                }
+                transitions::smooth::record_blur_passes(&mut builder, &res.smooth, pc, [extent[0], extent[1]])?;
             }
 
-            // Mark first-frame initialization complete (blend + fluid init_velocity)
+            // Mark first-frame initialization complete
             if self.is_transitioning {
                 self.transition_blended = true;
             }
 
-            // Pass 3: Composite slide over simulated feedback and present to swapchain
+            // Composite slide over simulated feedback and present to swapchain
             builder
                 .begin_rendering(RenderingInfo {
                     color_attachments: vec![Some(RenderingAttachmentInfo {
