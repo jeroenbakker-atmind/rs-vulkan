@@ -212,6 +212,17 @@ layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_src;
 layout(set = 0, binding = 1, rgba16f) uniform readonly image2D u_vel;
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D u_dst;
 
+float catrom_weight(float d) {
+    d = abs(d);
+    if (d < 1.0) {
+        return 1.5 * d * d * d - 2.5 * d * d + 1.0;
+    } else if (d < 2.0) {
+        return -0.5 * d * d * d + 2.5 * d * d - 4.0 * d + 2.0;
+    } else {
+        return 0.0;
+    }
+}
+
 void main() {
     ivec2 c = ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz = imageSize(u_src);
@@ -222,19 +233,23 @@ void main() {
     vec2 src_uv = uv - vel * pc.dt;
     src_uv = clamp(src_uv, vec2(0.0), vec2(1.0));
 
-    // Manual bilinear interpolation
+    // Catmull-Rom bicubic interpolation (preserves high frequencies
+    // much better than bilinear, reducing numerical diffusion)
     vec2 f = src_uv * vec2(sz) - 0.5;
     ivec2 ic = ivec2(floor(f));
     vec2 fr = f - vec2(ic);
-    ivec2 c00 = clamp(ic + ivec2(0, 0), ivec2(0), sz - 1);
-    ivec2 c10 = clamp(ic + ivec2(1, 0), ivec2(0), sz - 1);
-    ivec2 c01 = clamp(ic + ivec2(0, 1), ivec2(0), sz - 1);
-    ivec2 c11 = clamp(ic + ivec2(1, 1), ivec2(0), sz - 1);
-    vec4 v00 = imageLoad(u_src, c00);
-    vec4 v10 = imageLoad(u_src, c10);
-    vec4 v01 = imageLoad(u_src, c01);
-    vec4 v11 = imageLoad(u_src, c11);
-    vec4 result = mix(mix(v00, v10, fr.x), mix(v01, v11, fr.x), fr.y);
+
+    vec4 result = vec4(0.0);
+    for (int dy = -1; dy <= 2; dy++) {
+        for (int dx = -1; dx <= 2; dx++) {
+            ivec2 p = clamp(ic + ivec2(dx, dy), ivec2(0), sz - 1);
+            float ddx = float(dx) - fr.x;
+            float ddy = float(dy) - fr.y;
+            float wx = catrom_weight(ddx);
+            float wy = catrom_weight(ddy);
+            result += imageLoad(u_src, p) * wx * wy;
+        }
+    }
 
     imageStore(u_dst, c, result);
 }
@@ -374,8 +389,11 @@ void main() {
     }
 }
 
-// Initialize velocity field from feedback image gradient (first frame)
-mod cs_fluid_init_velocity {
+// Compute buoyancy force from density gradient and add to existing velocity.
+// Runs every frame so the density gradient continuously drives the flow.
+// Without this, the projection step (Helmholtz-Hodge) would cancel any
+// purely-gradient velocity field, leaving v=0.
+mod cs_fluid_add_buoyancy {
     vulkano_shaders::shader! {
         ty: "compute",
         src: r"
@@ -391,7 +409,7 @@ layout(push_constant) uniform PC {
 } pc;
 
 layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_feedback;
-layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_vel;
+layout(set = 0, binding = 1, rgba16f) uniform image2D u_vel;
 
 float luminance(vec3 c) {
     return dot(c, vec3(0.299, 0.587, 0.114));
@@ -412,8 +430,9 @@ void main() {
     float lum_d = luminance(imageLoad(u_feedback, d).rgb);
     float lum_u = luminance(imageLoad(u_feedback, up).rgb);
 
-    vec2 vel = vec2(lum_r - lum_l, lum_d - lum_u) * pc.dt;
-    imageStore(u_vel, c, vec4(vel.x, vel.y, 0.0, 0.0));
+    vec2 grad = vec2(lum_r - lum_l, lum_d - lum_u) * pc.dt;
+    vec2 existing_vel = imageLoad(u_vel, c).rg;
+    imageStore(u_vel, c, vec4(existing_vel * pc.dx + grad, 0.0, 0.0));
 }
 ",
     }
@@ -804,6 +823,7 @@ pub struct App {
     pub last_frame: Instant,
     pub transition_direction: (f32, f32),
     pub transition_blended: bool,
+    pub last_frame_dt: f32,
     previous_frame: Option<Box<dyn GpuFuture>>,
 }
 
@@ -1306,8 +1326,8 @@ pub fn create_app(
         .map_err(|e| format!("cs_fluid_jacobi load: {e}"))?;
     let cs_fluid_gradient_subtract_module = cs_fluid_gradient_subtract::load(device.clone())
         .map_err(|e| format!("cs_fluid_gradient_subtract load: {e}"))?;
-    let cs_fluid_init_velocity_module = cs_fluid_init_velocity::load(device.clone())
-        .map_err(|e| format!("cs_fluid_init_velocity load: {e}"))?;
+    let cs_fluid_init_velocity_module = cs_fluid_add_buoyancy::load(device.clone())
+        .map_err(|e| format!("cs_fluid_add_buoyancy load: {e}"))?;
 
     let vs_entry = vs_module
         .entry_point("main")
@@ -1335,7 +1355,7 @@ pub fn create_app(
         .ok_or("Cs_fluid_gradient_subtract compute shader entry point 'main' not found")?;
     let cs_fluid_init_velocity_entry = cs_fluid_init_velocity_module
         .entry_point("main")
-        .ok_or("Cs_fluid_init_velocity compute shader entry point 'main' not found")?;
+        .ok_or("Cs_fluid_add_buoyancy compute shader entry point 'main' not found")?;
     let fs_present_entry = fs_present_module
         .entry_point("main")
         .ok_or("Fs_present fragment shader entry point 'main' not found")?;
@@ -1881,6 +1901,7 @@ pub fn create_app(
         transition_direction: (0.0, 0.0),
         config,
         last_frame: Instant::now(),
+        last_frame_dt: 0.0,
         previous_frame: None,
     })
 }
@@ -2033,6 +2054,7 @@ impl App {
     pub fn update(&mut self) {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
+        self.last_frame_dt = dt;
         self.last_frame = now;
 
         if !self.is_transitioning {
@@ -2053,6 +2075,7 @@ impl App {
         if self.transition_time >= end_dur {
             self.is_transitioning = false;
             self.previous_layer = self.current_layer;
+            self.transition_blended = false;
         }
     }
 
@@ -2066,7 +2089,6 @@ impl App {
 
         let blur_radius = match self.config.transition_type {
             TransitionType::Smooth => 20.0,
-            TransitionType::Fluid => self.transition_time,
             _ => 0.0,
         };
 
@@ -2131,7 +2153,6 @@ impl App {
                         1,
                     ])?;
                 }
-                self.transition_blended = true;
             }
 
             // --- Stable fluids simulation ---
@@ -2139,12 +2160,18 @@ impl App {
                 let ext_x = (extent[0] + 15) / 16;
                 let ext_y = (extent[1] + 15) / 16;
 
-                // First frame only: init velocity from feedback gradient
-                if self.is_transitioning && !self.transition_blended {
-                    let init_pc = PushConstants {
+                // Add buoyancy force from density gradient to velocity (every frame).
+                // The Helmholtz-Hodge projection removes the curl-free (gradient)
+                // component of velocity, so a purely gradient velocity would be
+                // canceled to zero. By adding the gradient every frame and then
+                // self-advecting, the velocity develops a divergence-free component
+                // that survives projection and drives meaningful flow.
+                {
+                    let damping = (-self.last_frame_dt * 3.0).exp();
+                    let buoy_pc = PushConstants {
                         current_layer: 0, previous_layer: 0,
-                        blur_radius: 50.0,   // velocity scale factor
-                        slide_offset_x: 1.0, slide_offset_y: 1.0,
+                        blur_radius: self.last_frame_dt * 50.0,
+                        slide_offset_x: damping, slide_offset_y: 1.0,
                     };
                     builder
                         .bind_pipeline_compute(res.fluid_init_velocity_pipeline.clone())?
@@ -2153,7 +2180,7 @@ impl App {
                             res.fluid_2binding_layout.clone(), 0,
                             res.fluid_init_velocity_ds.clone(),
                         )?
-                        .push_constants(res.fluid_2binding_layout.clone(), 0, init_pc)?;
+                        .push_constants(res.fluid_2binding_layout.clone(), 0, buoy_pc)?;
                     unsafe { builder.dispatch([ext_x, ext_y, 1])?; }
                 }
 
@@ -2286,6 +2313,11 @@ impl App {
                         1,
                     ])?;
                 }
+            }
+
+            // Mark first-frame initialization complete (blend + fluid init_velocity)
+            if self.is_transitioning {
+                self.transition_blended = true;
             }
 
             // Pass 3: Composite slide over simulated feedback and present to swapchain
